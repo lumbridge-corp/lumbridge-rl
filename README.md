@@ -1,0 +1,248 @@
+> **lumbridge-rl** is [Lumbridge](https://github.com/lumbridge-corp)'s light fork of [prime-rl](https://github.com/PrimeIntellect-ai/prime-rl) by Prime Intellect (Apache-2.0), with a DGX Spark install profile. What we changed: [LUMBRIDGE.md](LUMBRIDGE.md). The upstream README follows.
+
+<p align="center">
+</p>
+
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/40c36e38-c5bd-4c5a-9cb3-f7b902cd155d#gh-light-mode-only" alt="Prime Intellect" width="312">
+  <img src="https://github.com/user-attachments/assets/6414bc9b-126b-41ca-9307-9e982430cde8#gh-dark-mode-only"  alt="Prime Intellect" width="312">
+</p>
+
+---
+
+<h3 align="center">
+prime-rl: Async RL Training at Scale
+</h3>
+
+---
+
+</br>
+<p align="center">
+  <a href="https://github.com/PrimeIntellect-ai/prime-rl/actions/workflows/style.yml">
+    <img src="https://github.com/PrimeIntellect-ai/prime-rl/actions/workflows/style.yml/badge.svg" alt="Style" />
+  </a>
+  <a href="https://github.com/PrimeIntellect-ai/prime-rl/actions/workflows/tests.yml">
+    <img src="https://github.com/PrimeIntellect-ai/prime-rl/actions/workflows/tests.yml/badge.svg" alt="Tests" />
+  </a>
+</p>
+
+## Overview
+
+prime-rl is a framework for large-scale reinforcement learning. It is designed to be easy to use and hackable, yet capable of scaling to 1000+ GPUs. Here is what we think sets it apart:
+
+1. Fully asynchronous RL for high-throughput agentic training at scale.
+2. Performant: built to train 1T+ MoE models on 1000+ GPUs with [FSDP2](https://docs.pytorch.org/tutorials/intermediate/FSDP_tutorial.html) for training and [vLLM](https://github.com/vllm-project/vllm) for inference, with FP8 inference, PD disaggregation, EP and CP parallelism, and more.
+3. Native integration with [`verifiers`](https://github.com/PrimeIntellect-ai/verifiers) environments through the [Environments Hub](https://app.primeintellect.ai/dashboard/environments?ex_sort=most_stars), including built-in support for SWE and agentic environments.
+4. End-to-end post-training: SFT, RL training, and evals.
+5. Multi-node deployment with Slurm support.
+6. Multimodal support for Qwen3.5 and Qwen3.8 VLMs, with [image RL and SFT examples](examples/extra/vlm/README.md).
+7. Hackable, modular, and extensible by design.
+8. One-line SLURM deployment for frontier models — e.g. [`GLM-5` FP8 with P/D disaggregation, the `llm-d` router, and Mooncake KV offload](examples/advanced/glm-5.3/).
+
+
+## Models support
+
+
+The trainer runs the PrimeRL model implementations under `src/prime_rl/trainer/models/`: dense Llama, Qwen3 and Qwen3.5, plus the families in the table below, with expert parallelism (EP) for MoE layers, context parallelism (CP) for long sequences, and additional kernels like [quack-kernels](https://github.com/quack-kernels/quack-kernels). Other architectures fail at trainer setup.
+
+| Family | Example IDs | MoE | EP | CP |
+|--------|-------------|-----|----|-----|
+| GLM-5 (`glm_moe_dsa`) | `zai-org/GLM-5`, `zai-org/GLM-5-FP8` | yes | ✅ | ✅ |
+| GLM-5.3 Flash, text only (`glm5_next`) | `zai-org/GLM-5.3-Flash-BF16` | yes | ✅ | ✅ |
+| Qwen3 MoE (`qwen3_moe`) | `Qwen/Qwen3-30B-A3B`, … | yes | ✅ | ✅ |
+| Qwen3.5 MoE (`qwen3_5_moe`) | `Qwen/Qwen3.5-35B-A3B`, … | yes | ✅ | ✅ |
+| Qwen3.5 VLMs | see [advanced.md](docs/advanced.md#multimodal-training) (`qwen3_5`, `qwen3_5_moe`) | MoE only on MoE VLMs | MoE only | ✅ |
+| Qwen3.8 Flash Next VLM (`qwen4_exp`) | `Qwen/Qwen3.8-Flash-Next` | yes | ✅ | ✅ |
+| Poolside Laguna (`laguna`) | `poolside/Laguna-XS.2` | yes | ✅ | ✅ |
+| MiniMax M2 (`minimax_m2`) | `MiniMax/MiniMax-M2` | yes | ✅ | ✅ |
+| Muse Glimmer, text only (`muse_glimmer`) | `meta-models/Muse-Glimmer-30B` | no | — | ✅ |
+| Nemotron H (`nemotron_h`) | `nvidia/Nemotron-3-Nano-30B-A3B`, `nvidia/Nemotron-3-Super-120B-A12B`, … | yes | ✅ | ✅ |
+| Nemotron H Omni (`nemotron_h_omni`, text only) | `nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16` | yes | ✅ | ✅ |
+| Trinity (`afmoe`) | `arcee-ai/Trinity-Mini`, … | yes | ✅ | ✅ |
+| GLM-4 · GLM-4.5 MoE · INTELLECT-3 (`glm4_moe`) | `THUDM/GLM-4-9B-0414`, `zai-org/GLM-4.5-Air`, `zai-org/GLM-4.5`, `PrimeIntellect/INTELLECT-3`, … | yes | ✅ | ✅ |
+| GPT-OSS (`gpt_oss`) | `unsloth/gpt-oss-20b-BF16`, … | yes | ✅ | ✅ |
+
+## Setup
+
+> *We develop and test on NVIDIA RTX 3090/4090/5090, A100, H100, H200, and B200. If your setup fails, please create an [issue](https://github.com/PrimeIntellect-ai/prime-rl/issues).*
+
+### Prerequisites
+
+Currently, you **need at least one NVIDIA GPU to use prime-rl**. If you don't already have access to one, we recommend our [compute platform](https://app.primeintellect.ai) for everything from renting on-demand single GPUs for developing, debugging and small ablations, to [reserving 1000+ GPU clusters](https://app.primeintellect.ai/dashboard/quotes) for production-scale training.
+
+### Quick Setup
+
+Set up prime-rl in a single command.
+
+```bash
+curl -sSL https://raw.githubusercontent.com/PrimeIntellect-ai/prime-rl/main/scripts/install.sh | bash
+```
+
+<details>
+<summary>
+Manual Setup
+</summary>
+<br>
+
+1. Clone the repository
+
+```bash
+git clone https://github.com/PrimeIntellect-ai/prime-rl.git
+cd prime-rl
+```
+
+2. Initialize submodules
+
+```bash
+git submodule update --init -- deps/verifiers deps/renderers deps/prime-envs deps/pydantic-config
+```
+
+3. Install [uv](https://docs.astral.sh/uv/)
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source $HOME/.local/bin/env
+```
+
+4. Install dependencies from the lock file
+
+```bash
+uv sync --all-extras
+```
+
+> *NOTE*: Environments are opt-in uv workspace members — `uv sync --all-extras` does not install them. To train on them, install all with `uv sync --all-extras --all-packages`, or a subset with `uv sync --package prime-rl --package <env>`.
+
+</details>
+
+<details>
+<summary>
+Validate your environment setup
+</summary>
+<br>
+
+1. Check that the environment uses Python 3.12
+
+```bash
+uv run python -V
+```
+
+2. Check that `flash-attn` is installed
+
+```bash
+uv run python -c "import flash_attn"
+```
+
+3. Check that you can run SFT trainer  (*this requires 1 GPU*)
+
+```bash
+uv run sft @ configs/debug/fake/sft.toml
+```
+
+4. Check that you can run the inference server (*this requires 1 GPU*)
+
+```bash
+uv run inference --vllm.model Qwen/Qwen3-0.6B
+```
+
+5. Check that the full RL stack (inference + orchestrator + trainer) runs end-to-end (*this requires 2 GPUs*)
+
+```bash
+uv run rl @ examples/basic/reverse-text/rl.toml
+```
+
+</details>
+
+### Additional Setup
+
+1. If you want to log your runs to [W&B](https://wandb.ai), log in
+
+```bash
+uv run wandb login
+# Or set `export WANDB_API_KEY=...`
+```
+
+2. If you require gated/ private models or datasets from [HuggingFace](https://huggingface.co), log in
+
+```bash
+uv run hf auth login
+# Or set `export HF_TOKEN=...`
+```
+
+## Training Examples
+We provide end-to-end training examples in the [`examples`](examples) directory to highlight features of the framework and guide you through the process of training your own models.
+
+### Basic Training: 1 to 8 GPUs
+
+Follow this guide to learn the basics of prime-rl. You can train your own models on 1 to 8 GPUs. Ideal for getting started and exploring the capabilities of the framework. These guides cover most use cases -- single-turn, multi-turn, tool calling, etc. -- on toy environments and small models.
+
+1. [**Reverse Text**](examples/basic/reverse-text/README.md): Train `Qwen3-0.6B` to reverse a small chunk of text. Demonstrates tiny-scale single-turn SFT and RL training. Can be trained on a single consumer GPU in a few minutes, and is ideal for getting started.
+2. [**Wordle**](examples/basic/wordle/README.md): Train `Qwen3-1.7B` to play Wordle. A fun example of multi-turn SFT and RL training. Can be trained on a 2-4 H100 GPUs in a few hours. Ideal for exploring the multi-turn training capabilities of the framework.
+3. [**Alphabet Sort**](examples/basic/alphabet-sort/README.md): Train `Qwen3-4B-Instruct-2507` to sort names alphabetically. Demonstrates multi-turn RL training via LoRA without SFT warmup. Can be trained on a single H100 GPU in just over an hour. Ideal for exploring LoRA-based training.
+4. [**Wiki Search**](examples/basic/wiki-search/README.md): Train `Qwen3-4B-Instruct-2507` to answer trivia questions by searching through a Wikipedia. Demonstrates multi-turn with web search tool use.
+5. [**Hendrycks Sanity**](examples/basic/hendrycks-sanity/README.md): Run a sanity check experiment on `Qwen3-1.7B` using a subset of MATH filtered to problems that `DeepSeek-R1-Distill-Qwen-1.5B` partially solves (20-80%). Useful for algorithm ablations.
+
+### Advanced Training: 32 - 2048 GPUs:
+
+Follow this guide to train large models on hard reasoning and agentic tasks.
+These guides are designed to be run from a Slurm cluster.
+
+1. [**Qwen3-30B-A3B**](examples/advanced/qwen3-30b-a3b/): Train `Qwen3-30B-A3B` on math, SWE, and agentic tool use.
+2. [**GLM-4.5-Air**](examples/advanced/glm-4.5-air/): Train `GLM-4.5-Air` on search, SWE, and terminal tasks.
+3. [**GLM-5**](examples/advanced/glm-5.3/): Large-scale `GLM-5`/`GLM-5.3` training with P/D disaggregation, the `llm-d` router, and FP8.
+
+## Docs
+
+Check out the [docs](docs) directory for in-depth guides on how to use prime-rl.
+
+- [**Overview**](docs/overview.md) - Architecture, install, and a copy-pasteable end-to-end RL run
+- [**Configuration**](docs/configuration.md) - TOML composition, CLI overrides, env vars, validation
+- [**Training**](docs/training.md) - RL, SFT, checkpointing, observability, rules of thumb
+- [**Eval**](docs/eval.md) - Standalone evals against any inference server, online evals, resume, platform upload
+- [**Scaling**](docs/scaling.md) - Single-GPU through multi-node, FSDP/EP/CP, SLURM, benchmarking
+- [**Algorithms**](docs/algorithms.md) - Async training and staleness, the AIPO loss, advantage and filter plugins, trajectory merging
+- [**Advanced**](docs/advanced.md) - Custom modeling, multimodal training, LoRA
+- [**Development**](docs/development.md) - Test suite, pre-commit hooks, adding a new model
+
+## Contributing
+
+We warmly welcome community contributions! We use [issues](https://github.com/PrimeIntellect-ai/prime-rl/issues) to track bugs, feature requests, and share our internal roadmap. If you encounter bugs, have pain points during development, or have ideas for new features, please open an issue.
+
+Contributions are welcome via PR. Please follow these guidelines:
+1. Install the [pre-commit hooks](#pre-commit-hooks) to ensure your code is formatted correctly.
+2. Please keep your PR in "Draft" until it is ready for review.
+3. If your PR resolves an issue, please link the issue in the PR description
+4. If you can, try running the [test suite](#tests) locally to ensure your changes are working as expected.
+
+### Pre-Commit Hooks
+
+Please install the [pre-commit](https://pre-commit.com) hooks to ensure your code is formatted correctly.
+
+```bash
+uv run pre-commit install
+```
+
+### Tests
+
+```bash
+uv run pytest -v                    # everything
+uv run pytest tests/unit -v         # unit only
+uv run pytest tests/integration -v  # integration only
+uv run pytest -v -m "not gpu"       # CPU-only (inverse of the gpu marker)
+```
+
+## License
+
+This project is licensed under the Apache 2.0 license, as found in the [License](LICENSE) file.
+
+## Citation
+
+If you find our work useful, feel free to cite it using
+
+```tex
+@misc{primeintellect2025prime-rl,
+  author = {Prime Intellect},
+  title = {prime-rl},
+  url = {https://github.com/PrimeIntellect-ai/prime-rl},
+  year = {2025}
+}
+```

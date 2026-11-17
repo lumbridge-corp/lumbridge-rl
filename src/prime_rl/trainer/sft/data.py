@@ -1,0 +1,558 @@
+import json
+import time
+import uuid
+from pathlib import Path
+from typing import Any, Callable, Literal, cast
+
+import numpy as np
+import torch
+from datasets import Dataset, interleave_datasets, load_dataset
+from huggingface_hub import snapshot_download
+from renderers import AutoRendererConfig, RendererConfig, merge_chat_template_kwargs
+from renderers.base import MultiModalData, PlaceholderRange, Renderer, build_training_sample, create_renderer
+from torch import Tensor
+from transformers.tokenization_utils import PreTrainedTokenizer
+
+from prime_rl.configs.sft import DataConfig, LossMaskConfig, SFTColumnsConfig, SFTDataConfig
+from prime_rl.trainer.data import StatefulIterableDataset
+from prime_rl.utils.chat_template import deserialize_tool_calls, normalize_messages
+from prime_rl.utils.logger import get_logger
+from prime_rl.utils.utils import format_time
+
+
+class FakeDataset(StatefulIterableDataset):
+    """A dataset of fake tokens"""
+
+    def __init__(
+        self,
+        vocab_size: int,
+        seq_len: int,
+        length: Literal["fixed", "variable"] = "fixed",
+        input_ids: Literal["increasing", "random"] = "random",
+        seed: int = 0,
+        non_dp_size: int = 1,
+    ):
+        super().__init__(non_dp_size)
+        self.vocab_size = vocab_size
+        self.seq_len = seq_len
+        self.length = length
+        self.input_ids = input_ids
+        self.seed = seed
+
+    def _draw_sample(self, generator: torch.Generator) -> tuple[int, list[int] | None]:
+        # Consume this samples "randomness" - fast forwarding must replay it to restore the generator state
+        seq_len = (
+            int(torch.randint(1, self.seq_len, (1,), generator=generator).item())
+            if self.length == "variable"
+            else self.seq_len
+        )
+        random_input_ids = (
+            torch.randint(0, self.vocab_size, (seq_len + 1,), generator=generator).long().tolist()
+            if self.input_ids == "random"
+            else None
+        )
+        return seq_len, random_input_ids
+
+    def __iter__(self):
+        self._setup_world_info()
+        # use a rank seeded PRNG instead of torch global default PRNG because with num workers > 0
+        # the data loader reseeds the global PRNG per worker process
+        generator = torch.Generator().manual_seed(self.seed + self.data_rank)
+        if self.fast_forward:
+            # step counts globally emmited samples but this rank is only emitted every data_world_size-TH
+            already_emitted = len(range(self.data_rank, self.step, self.data_world_size))
+            for _ in range(already_emitted):
+                self._draw_sample(generator)
+            self.fast_forward = False
+
+        while True:
+            self.step += 1
+
+            # Skip samples that don't belong to this data rank
+            if (self.step - 1) % self.data_world_size != self.data_rank:
+                continue
+
+            seq_len, random_input_ids = self._draw_sample(generator)
+            input_ids = [self.step - 1] * (seq_len + 1) if random_input_ids is None else random_input_ids
+            position_ids = list(range(seq_len))
+            loss_mask = [True] * seq_len
+            fake_sample = {
+                "input_ids": input_ids[:-1],
+                "target_ids": input_ids[1:],
+                "position_ids": position_ids,
+                "loss_mask": loss_mask,
+                "seq_lens": [seq_len],
+                "mm_kwargs": None,
+                "mm_token_type_ids": None,
+            }
+            self.num_samples["fake"] += 1
+            self.num_tokens["fake"] += seq_len
+            yield fake_sample
+
+
+def _flatten_mm_items(mm_items: dict[str, list[dict[str, Any]]]) -> dict[str, Tensor]:
+    """Fold per-item renderer outputs into model-forward tensors."""
+    out: dict[str, Tensor] = {}
+    for items in mm_items.values():
+        for item in items:
+            for key, value in item.items():
+                if not isinstance(value, (np.ndarray, Tensor)):
+                    continue
+                tensor = torch.as_tensor(value)
+                out[key] = torch.cat([out[key], tensor], dim=0) if key in out else tensor
+    return out
+
+
+def _drop_null_fields(value: Any, path: tuple[str, ...] = ()) -> Any:
+    """Recursively strip ``None``-valued keys from dict structures.
+
+    PyArrow's JSON loader unifies schemas across rows, so heterogeneous
+    OAI content blocks (text vs image_url) end up with all union keys
+    filled with ``None`` where absent. That confuses permissive
+    content-type predicates inside renderers (e.g. ``"image_url" in item``
+    returns ``True`` even when the value is null). Strip the noise before
+    handing messages off to the renderer. Tool-call arguments are opaque
+    JSON payloads, so preserve their null values.
+    """
+    if path[-3:] == ("tool_calls", "function", "arguments"):
+        return value
+    if isinstance(value, dict):
+        return {k: _drop_null_fields(v, (*path, k)) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_drop_null_fields(v, path) for v in value]
+    return value
+
+
+def _find_image_safe_cut(budget: int, mm: MultiModalData | None) -> int:
+    """Return the largest cut at most ``budget`` outside placeholder runs."""
+    if mm is None or not mm.mm_placeholders:
+        return budget
+    cut = budget
+    for ranges in mm.mm_placeholders.values():
+        for placeholder in ranges:
+            if placeholder.offset < cut < placeholder.offset + placeholder.length:
+                cut = placeholder.offset
+    return cut
+
+
+def _truncate_mm_data(mm: MultiModalData, cut: int) -> MultiModalData:
+    """Drop multimodal items whose placeholder ranges extend past ``cut``."""
+    new_placeholders: dict[str, list[PlaceholderRange]] = {}
+    new_items: dict[str, list[dict[str, Any]]] = {}
+    new_hashes: dict[str, list[str]] = {}
+    for content_type, ranges in mm.mm_placeholders.items():
+        keep = [index for index, placeholder in enumerate(ranges) if placeholder.offset + placeholder.length <= cut]
+        if not keep:
+            continue
+        new_placeholders[content_type] = [ranges[index] for index in keep]
+        new_items[content_type] = [mm.mm_items[content_type][index] for index in keep]
+        if content_type in mm.mm_hashes:
+            new_hashes[content_type] = [mm.mm_hashes[content_type][index] for index in keep]
+    return MultiModalData(mm_hashes=new_hashes, mm_placeholders=new_placeholders, mm_items=new_items)
+
+
+class RendererResolver:
+    """Picks the renderer for a dataset row.
+
+    ``columns`` maps renderer fields to dataset columns; a row's non-null
+    values override the configured renderer's fields, validated as
+    chat-template kwargs. Renderer configs are frozen, so renderers are cached
+    per config and rows that resolve to the same config share one instance.
+    """
+
+    def __init__(
+        self,
+        tokenizer: PreTrainedTokenizer,
+        config: RendererConfig,
+        processor: Any | None = None,
+        columns: dict[str, str] | None = None,
+    ):
+        self.tokenizer = tokenizer
+        self.config = config
+        self.processor = processor
+        self.columns = SFTColumnsConfig().renderer if columns is None else columns
+        self.renderers: dict[RendererConfig, Renderer] = {}
+
+    def resolve_config(self, example: dict) -> RendererConfig:
+        kwargs = {field: example[column] for field, column in self.columns.items() if example.get(column) is not None}
+        if not kwargs:
+            return self.config
+        if isinstance(self.config, AutoRendererConfig):
+            raise ValueError(
+                f"Per-sample renderer arguments {sorted(kwargs)} require a typed renderer config "
+                "(e.g. [renderer] name = 'qwen3.8'), not renderer.name = 'auto'"
+            )
+        return merge_chat_template_kwargs(self.config, kwargs)
+
+    def __call__(self, example: dict) -> Renderer:
+        config = self.resolve_config(example)
+        renderer = self.renderers.get(config)
+        if renderer is None:
+            renderer = create_renderer(self.tokenizer, config)
+            if self.processor is not None and hasattr(renderer, "_processor"):
+                renderer._processor = self.processor
+            if not getattr(renderer, "is_prefix_stable", False):
+                get_logger().warning(
+                    f"SFT renderer {type(renderer).__name__} does not guarantee prefix stability. "
+                    "SFT renders each conversation once to produce one training sample; "
+                    "it does not expand N assistant turns into N samples. Depending on the template, "
+                    "reasoning from earlier turns may be omitted from the training sample."
+                )
+            self.renderers[config] = renderer
+        return renderer
+
+
+class SFTDataset(StatefulIterableDataset):
+    """A dataset wrapping a HF SFT dataset with prompt/completion or raw messages format."""
+
+    def __init__(
+        self,
+        dataset: Dataset,
+        renderers: Callable[[dict], Renderer],
+        shuffle: bool = True,
+        seed: int = 0,
+        seq_len: int = 128,
+        non_dp_size: int = 1,
+        loss_mask_config: LossMaskConfig = LossMaskConfig(),
+        max_examples: int | None = None,
+        max_epochs: int | None = None,
+        multimodal: bool = False,
+        columns: SFTColumnsConfig = SFTColumnsConfig(),
+    ):
+        super().__init__(non_dp_size)
+        self.logger = get_logger()
+        self.dataset = dataset
+        self.num_examples = len(self.dataset)
+        self.renderers = renderers
+        self.columns = columns
+        # Default names are optional: a dataset carries either messages or
+        # prompt/completion, and tools only for tool use. A name set in the
+        # config must exist.
+        for field in ("messages", "prompt", "completion", "tools", "message_loss_mask"):
+            column = getattr(columns, field)
+            if column != field and column not in dataset.column_names:
+                raise ValueError(f"data.columns.{field} is {column!r}, but the dataset has only {dataset.column_names}")
+        self.shuffle = shuffle
+        self.seed = seed
+        self.seq_len = seq_len
+        self.loss_mask_config = loss_mask_config
+        self.max_examples = max_examples
+        self.max_epochs = max_epochs
+        self.multimodal = multimodal
+
+        # If specified, select a subset of the dataset
+        if self.max_examples is not None:
+            self.num_examples = min(self.num_examples, self.max_examples)
+            self.dataset = self.dataset.take(self.max_examples)
+
+    def _process(self, example: dict) -> dict | None:
+        def resolve_messages(example: dict) -> list[dict]:
+            # `messages` takes precedence over explicit split fields and is interpreted
+            # as a whole-chat training sample with an empty prompt. Null-check rather
+            # than key-check: Arrow schema union adds `messages: null` to
+            # prompt/completion rows whenever other rows have a `messages` column.
+            columns = self.columns
+            if example.get(columns.messages) is not None:
+                messages = normalize_messages(example[columns.messages], default_role="assistant")
+            elif example.get(columns.prompt) is not None and example.get(columns.completion) is not None:
+                messages = normalize_messages(example[columns.prompt], default_role="user") + normalize_messages(
+                    example[columns.completion], default_role="assistant"
+                )
+            else:
+                raise ValueError(
+                    f"All examples in the dataset must have either a {columns.messages!r} column "
+                    f"or both {columns.prompt!r} and {columns.completion!r} columns for SFT"
+                )
+
+            # Strip nulls before deserializing so genuine nulls inside tool-call
+            # argument strings survive.
+            messages = [_drop_null_fields(m) for m in messages]
+            return deserialize_tool_calls(messages)
+
+        messages = resolve_messages(example)
+
+        # Tool schemas in OpenAI function-calling format, as a list of dicts or a
+        # JSON-encoded string of one.
+        tools = example.get(self.columns.tools) or []
+        if isinstance(tools, str):
+            tools = json.loads(tools)
+
+        def should_mask(message: dict) -> bool:
+            assert "role" in message, "Message must have a role"
+            match message["role"]:
+                case "user":
+                    return self.loss_mask_config.user
+                case "assistant":
+                    return self.loss_mask_config.assistant
+                case "system":
+                    return self.loss_mask_config.system
+                case "tool":
+                    return self.loss_mask_config.tool
+                case _:
+                    raise ValueError(f"Invalid message role: {message['role']}")
+
+        # Let the renderer identify sampled targets when assistant loss is enabled.
+        role_to_mask = None if self.loss_mask_config.assistant else should_mask
+
+        # Non-assistant roles are opted into the loss via the renderer's
+        # body-only path: the message content is trained, not the role
+        # scaffolding (e.g. <|im_start|>assistant) the harness emits.
+        content_sft_roles = {role for role in ("user", "system", "tool") if getattr(self.loss_mask_config, role)}
+        renderer = self.renderers(example)
+        sample = build_training_sample(
+            renderer,
+            messages,
+            role_to_mask=role_to_mask,
+            tools=tools,
+            content_sft_roles=content_sft_roles or None,
+            ensure_final_stop=True,
+            message_loss_mask=example.get(self.columns.message_loss_mask),
+        )
+        input_ids = list(sample.token_ids)
+        loss_mask = list(sample.loss_mask)
+        mm = sample.multi_modal_data
+        mm_token_type_ids = list(sample.mm_token_type_ids) if sample.mm_token_type_ids is not None else None
+        if mm is not None and mm.mm_items and not self.multimodal:
+            raise ValueError(
+                "Renderer produced multimodal data but [model.vlm] is not set. "
+                "Set [model.vlm] to train on multimodal samples."
+            )
+
+        # Causal shift: model predicts next token from current.
+        target_ids = input_ids[1:]
+        loss_mask = loss_mask[1:]
+        input_ids = input_ids[:-1]
+        if mm_token_type_ids is not None:
+            mm_token_type_ids = mm_token_type_ids[:-1]
+
+        was_mm_truncated = False
+        if mm is not None and len(input_ids) > self.seq_len:
+            was_mm_truncated = True
+            cut = _find_image_safe_cut(self.seq_len, mm)
+            self.logger.debug(
+                f"Truncating example {example.get('__index', '')} from "
+                f"{len(input_ids)} → {cut} tokens (budget={self.seq_len})"
+            )
+            input_ids = input_ids[:cut]
+            target_ids = target_ids[:cut]
+            loss_mask = loss_mask[:cut]
+            if mm_token_type_ids is not None:
+                mm_token_type_ids = mm_token_type_ids[:cut]
+            if mm.mm_items:
+                mm = _truncate_mm_data(mm, cut)
+
+        if was_mm_truncated and not set(renderer.get_stop_token_ids()) & set(target_ids):
+            return None
+
+        if sum(loss_mask[: self.seq_len]) == 0:
+            self.logger.warning(
+                f"Skipping example {example.get('__index', '')} because no trainable tokens were found within the context window ({self.seq_len}). This is to prevent NaN loss."
+            )
+            return None
+
+        assert len(input_ids) == len(loss_mask) == len(target_ids), (
+            f"input_ids, loss_mask and target_ids must have the same length, but got {len(input_ids)=}, {len(loss_mask)=}, {len(target_ids)=}"
+        )
+        assert sum(loss_mask) > 0, "There are no tokens in this sample that contribute to the loss"
+        assert set(renderer.get_stop_token_ids()) & set(target_ids), (
+            "A renderer stop token must be present in target_ids"
+        )
+
+        mm_kwargs: dict[str, Tensor] | None = None
+        if mm is not None and mm.mm_items:
+            mm_kwargs = _flatten_mm_items(mm.mm_items)
+            if any("video" in key for key in mm_kwargs):
+                raise ValueError("Video SFT is not supported; sample contains video inputs")
+        if mm_token_type_ids is not None:
+            assert len(mm_token_type_ids) == len(input_ids)
+
+        return {
+            "input_ids": input_ids,
+            "target_ids": target_ids,
+            "loss_mask": loss_mask,
+            "position_ids": list(range(len(input_ids))),
+            "seq_lens": [len(input_ids)],
+            "mm_kwargs": mm_kwargs,
+            "mm_token_type_ids": mm_token_type_ids,
+        }
+
+    def __iter__(self):
+        self._setup_world_info()
+        dataset = self.dataset.shuffle(seed=self.epoch + self.seed) if self.shuffle else self.dataset
+        while True:
+            self.step += 1
+
+            # Determine epoch from current step
+            epoch = (self.step - 1) // self.num_examples
+
+            # Break if max epochs is reached
+            if self.max_epochs is not None and epoch >= self.max_epochs:
+                break
+
+            # Update stored epoch if new epoch is reached, optionally shuffle
+            if epoch > self.epoch:
+                self.epoch = epoch
+                dataset = self.dataset.shuffle(seed=self.epoch + self.seed) if self.shuffle else self.dataset
+
+            # Skip samples that don't belong to this data rank
+            if (self.step - 1) % self.data_world_size != self.data_rank:
+                continue
+
+            # Get example
+            example = dataset[(self.step - 1) % self.num_examples]
+
+            # Process example
+            processed_example = self._process(cast(dict, example))
+
+            # If processed example is None, skip it (e.g. if tokenized sample exceeds context window)
+            if processed_example is None:
+                continue
+
+            # Yield the example
+            example = cast(dict, example)
+            subset_or_split = example.get("__subset") or example.get("__split")
+            self.logger.debug(
+                f"Yield example {example.get('__index', '')}"
+                + (f" from {subset_or_split} " if subset_or_split else " ")
+                + f"with {len(processed_example.get('input_ids', []))} tokens ({sum(processed_example.get('loss_mask', []))} trainable tokens)"
+            )
+            self.num_samples[subset_or_split] += 1
+            self.num_tokens[subset_or_split] += len(processed_example.get("input_ids", []))
+            yield processed_example
+
+
+def pre_download_data(data: DataConfig, env_vars: dict[str, str]) -> None:
+    if not isinstance(data, SFTDataConfig):
+        return
+    if Path(data.name).exists():
+        get_logger().info(f"Data {data.name} found at local path, skipping download")
+        return
+
+    dataset_name = data.name
+    t0 = time.perf_counter()
+    get_logger().info(f"Pre-downloading data {dataset_name} at revision {data.revision or 'main'}")
+    snapshot = snapshot_download(
+        repo_id=dataset_name,
+        repo_type="dataset",
+        revision=data.revision,
+        cache_dir=env_vars.get("HF_HUB_CACHE"),
+    )
+    data.name = snapshot
+    get_logger().debug(
+        f"Finished pre-downloading data {dataset_name} to {snapshot} in {format_time(time.perf_counter() - t0)}"
+    )
+
+
+def setup_and_interleave_datasets(
+    dataset_name: str,
+    subsets_and_splits: list[tuple[str | None, str]],
+    probabilities: list[float] | None,
+    stopping_strategy: Literal["first_exhausted", "all_exhausted"],
+    seed: int = 0,
+    revision: str | None = None,
+) -> Dataset:
+    logger = get_logger()
+    datasets = []
+    for subset, split in subsets_and_splits:
+        logger.debug(f"Loading dataset {dataset_name} with {subset=} and {split=}")
+        dataset = cast(Dataset, load_dataset(dataset_name, subset, split=split, revision=revision))
+        num_examples = len(dataset)
+        dataset = dataset.add_column("__subset", [subset] * num_examples, new_fingerprint=str(uuid.uuid4()))
+        dataset = dataset.add_column("__split", [split] * num_examples, new_fingerprint=str(uuid.uuid4()))
+        dataset = dataset.add_column("__index", list(range(num_examples)), new_fingerprint=str(uuid.uuid4()))
+        datasets.append(dataset)
+    if len(datasets) > 1:
+        logger.debug(f"Interleaving datasets with {probabilities=} and {stopping_strategy=}")
+        dataset = interleave_datasets(
+            datasets,
+            probabilities=probabilities,
+            stopping_strategy=stopping_strategy,
+            seed=seed,
+        )
+    else:
+        dataset = datasets[0]
+
+    return dataset
+
+
+def load_sft_dataset(config: SFTDataConfig) -> Dataset:
+    """Load and interleave the raw HF dataset. This is the expensive I/O step."""
+    logger = get_logger()
+    if config.subsets is None and config.splits is None:
+        return setup_and_interleave_datasets(
+            dataset_name=config.name,
+            subsets_and_splits=[(None, "train")],
+            probabilities=config.probabilities,
+            stopping_strategy=config.stopping_strategy,
+            revision=config.revision,
+        )
+    elif config.subsets is not None and config.splits is None:
+        logger.debug(f"Loading datasets for subsets {config.subsets} with default split 'train'")
+        return setup_and_interleave_datasets(
+            dataset_name=config.name,
+            subsets_and_splits=[(subset, "train") for subset in config.subsets],
+            probabilities=config.probabilities,
+            stopping_strategy=config.stopping_strategy,
+            revision=config.revision,
+        )
+    elif config.subsets is None and config.splits is not None:
+        logger.debug(f"Loading datasets for splits {config.splits} with default subset 'None'")
+        return setup_and_interleave_datasets(
+            dataset_name=config.name,
+            subsets_and_splits=[(None, split) for split in config.splits],
+            probabilities=config.probabilities,
+            stopping_strategy=config.stopping_strategy,
+            revision=config.revision,
+        )
+    else:
+        assert config.subsets is not None and config.splits is not None
+        logger.debug(f"Loading datasets for subsets {config.subsets} with splits {config.splits}")
+        return setup_and_interleave_datasets(
+            dataset_name=config.name,
+            subsets_and_splits=list(zip(config.subsets, config.splits)),
+            probabilities=config.probabilities,
+            stopping_strategy=config.stopping_strategy,
+            revision=config.revision,
+        )
+
+
+def setup_sft_dataset(
+    tokenizer: PreTrainedTokenizer,
+    config: DataConfig,
+    non_dp_size: int = 1,
+    *,
+    max_epochs: int | None = None,
+    raw_dataset: Dataset | None = None,
+    renderer_config: RendererConfig | None = None,
+    processor: Any | None = None,
+    multimodal: bool = False,
+) -> StatefulIterableDataset:
+    if config.type == "fake":
+        return FakeDataset(
+            vocab_size=tokenizer.vocab_size,
+            seq_len=config.seq_len,
+            length=config.length,
+            input_ids=config.input_ids,
+            seed=config.seed,
+            non_dp_size=non_dp_size,
+        )
+    elif config.type == "sft":
+        if renderer_config is None:
+            raise ValueError("SFT data requires a renderer config.")
+        if raw_dataset is None:
+            raw_dataset = load_sft_dataset(config)
+        renderers = RendererResolver(tokenizer, renderer_config, processor=processor, columns=config.columns.renderer)
+        return SFTDataset(
+            raw_dataset,
+            renderers,
+            shuffle=config.shuffle,
+            seed=config.seed,
+            seq_len=config.seq_len,
+            loss_mask_config=config.loss_mask,
+            non_dp_size=non_dp_size,
+            max_epochs=max_epochs,
+            multimodal=multimodal,
+            columns=config.columns,
+        )
+    else:
+        raise ValueError(f"Invalid dataset type: {config.type}")

@@ -1,0 +1,245 @@
+import re
+from pathlib import Path
+
+from tests.conftest import ProcessResult
+
+
+def strip_escape_codes(text: str) -> str:
+    """Helper to strip escape codes from text"""
+    return re.sub(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])", "", text)
+
+
+def check_no_error(process: ProcessResult, run_dir: Path) -> None:
+    """Helper to assert that a process did not error"""
+    if process.returncode != 0:
+        print("=== Inference Outputs ===")
+        with open(run_dir / "logs" / "latest" / "inference.log", "r") as f:
+            print(*f.readlines()[-100:], sep="")
+        print("=== Orchestrator Outputs ===")
+        with open(run_dir / "logs" / "latest" / "orchestrator.log", "r") as f:
+            print(*f.readlines()[-1000:], sep="")
+    assert process.returncode == 0, f"Process has non-zero return code ({process})"
+
+
+def check_number_goes_up_or_down(
+    lines: list[str],
+    start_step: int = 0,
+    end_step: int = -1,
+    pattern: str = r"Reward:?\s+(\d+\.\d{4})",
+    go_up: bool = True,
+):
+    """Helper to assert that a number in lines goes up from a specified start to end step"""
+    step_lines = [line for line in lines if "SUCCESS" in line and "Step" in line and re.search(pattern, line)]
+    assert len(step_lines) > 0, f"No step lines found in output ({lines})"
+    try:
+        start_step_line = step_lines[start_step]
+    except IndexError:
+        start_step_line = ""
+    try:
+        end_step_line = step_lines[end_step]
+    except IndexError:
+        end_step_line = ""
+    assert start_step_line, f"Could not find start step {start_step} in output ({lines})"
+    assert end_step_line, f"Could not find end step {end_step} in output ({lines})"
+    start_step_match = re.search(pattern, start_step_line)
+    end_step_match = re.search(pattern, end_step_line)
+    assert start_step_match is not None, (
+        f"Could not find number for start step {start_step} in line {start_step_line} ({lines})"
+    )
+    assert end_step_match is not None, (
+        f"Could not find number for end step {end_step} in line {end_step_line} ({lines})"
+    )
+    start_step_number = float(start_step_match.group(1))
+    end_step_number = float(end_step_match.group(1))
+    if go_up:
+        assert start_step_number < end_step_number, (
+            f"Number did not go up. Found start_number={start_step_number} <= end_number={end_step_number} "
+            f"(start line: {start_step_line}, end line: {end_step_line}) ({lines})"
+        )
+    else:
+        assert start_step_number > end_step_number, (
+            f"Number did not go down. Found start_number={start_step_number} >= end_number={end_step_number} "
+            f"(start line: {start_step_line}, end line: {end_step_line}) ({lines})"
+        )
+
+
+def check_metric_in_range(
+    lines: list[str],
+    metric_name: str,
+    pattern: str,
+    step: int = -1,
+    min_threshold: float | None = None,
+    max_threshold: float | None = None,
+):
+    """Helper to assert that a metric in step logs is within a threshold"""
+    step_lines = [line for line in lines if "SUCCESS" in line and "Step" in line and re.search(pattern, line)]
+    assert len(step_lines) > 0, f"No step lines found in output ({lines})"
+
+    # Search for the specific step number in the lines
+    if step == -1:
+        step_line = step_lines[-1]
+    else:
+        step_pattern = rf"Step {step}\b"
+        matching_lines = [line for line in step_lines if re.search(step_pattern, line)]
+        assert len(matching_lines) > 0, f"Could not find step {step} in output ({step_lines})"
+        step_line = matching_lines[0]
+
+    metric_match = re.search(pattern, step_line)
+    assert metric_match is not None, f"Could not find {metric_name} for step {step}. Line: {step_line} ({lines})"
+    metric_value = float(metric_match.group(1))
+    if min_threshold is not None:
+        assert metric_value >= min_threshold, (
+            f"{metric_name} did not reach minimum threshold. Found {metric_name}={metric_value} < {min_threshold} "
+            f"(line: {step_line}) ({lines})"
+        )
+    if max_threshold is not None:
+        assert metric_value <= max_threshold, (
+            f"{metric_name} exceeded maximum threshold. Found {metric_name}={metric_value} > {max_threshold} "
+            f"(line: {step_line}) ({lines})"
+        )
+
+
+def check_reward_goes_up(lines: list[str]):
+    return check_number_goes_up_or_down(lines, go_up=True, pattern=r"Reward:?\s+(\d+\.\d{4})")
+
+
+def check_loss_goes_down(lines: list[str]):
+    return check_number_goes_up_or_down(lines, go_up=False, pattern=r"Loss:?\s+(\d+\.\d{4})")
+
+
+def check_final_eval_reward_above(lines: list[str], env_name: str, min_threshold: float):
+    """Assert the last `Evaluated {env_name} | ... | Reward X.XXXX`
+    line reports a reward above ``min_threshold``.
+
+    Robust for short distill smokes: until the policy converges, eval reward is
+    truncation-dominated noise, so an endpoint "did it go up?" compare is a coin
+    flip (e.g. distillation here doesn't surface until ~step 13). A threshold
+    the converged plateau clears — but the early noise floor doesn't —
+    validates that training actually worked. Pick one between the two."""
+    pattern = rf"Evaluated {re.escape(env_name)} .*Reward:?\s+(\d+\.\d{{4}})"
+    eval_lines = [line for line in lines if "SUCCESS" in line and re.search(pattern, line)]
+    assert len(eval_lines) >= 2, f"Need at least 2 eval lines for {env_name!r}, found {len(eval_lines)}"
+    final = float(re.search(pattern, eval_lines[-1]).group(1))
+    assert final >= min_threshold, (
+        f"Final eval reward for {env_name!r} below threshold: {final} < {min_threshold}\nlast line: {eval_lines[-1]}"
+    )
+
+
+def check_reward_in_range(
+    lines: list[str],
+    step: int = -1,
+    min_threshold: float | None = 0.0,
+    max_threshold: float | None = None,
+):
+    """Helper to assert that reward in step logs is within a threshold"""
+    check_metric_in_range(
+        lines,
+        metric_name="Reward",
+        pattern=r"Reward:?\s+(\d+\.\d{4})",
+        step=step,
+        min_threshold=min_threshold,
+        max_threshold=max_threshold,
+    )
+
+
+def check_avg_reward_in_range(
+    lines: list[str],
+    last_n_steps: int,
+    min_threshold: float | None = None,
+    max_threshold: float | None = None,
+):
+    """Helper to assert that the average reward over the last N steps is within a threshold"""
+    pattern = r"Reward:?\s+(\d+\.\d{4})"
+    step_lines = [line for line in lines if "SUCCESS" in line and "Step" in line and re.search(pattern, line)]
+    assert len(step_lines) >= last_n_steps, (
+        f"Not enough step lines found. Expected at least {last_n_steps}, got {len(step_lines)}"
+    )
+
+    recent_lines = step_lines[-last_n_steps:]
+    rewards = []
+    for line in recent_lines:
+        match = re.search(pattern, line)
+        assert match is not None, f"Could not find Reward in line: {line}"
+        rewards.append(float(match.group(1)))
+
+    avg_reward = sum(rewards) / len(rewards)
+    if min_threshold is not None:
+        assert avg_reward >= min_threshold, (
+            f"Average reward over last {last_n_steps} steps did not reach minimum threshold. "
+            f"Found avg_reward={avg_reward:.4f} < {min_threshold} (rewards={rewards})"
+        )
+    if max_threshold is not None:
+        assert avg_reward <= max_threshold, (
+            f"Average reward over last {last_n_steps} steps exceeded maximum threshold. "
+            f"Found avg_reward={avg_reward:.4f} > {max_threshold} (rewards={rewards})"
+        )
+
+
+def check_avg_mismatch_kl_in_range(
+    lines: list[str],
+    last_n_steps: int,
+    min_threshold: float | None = None,
+    max_threshold: float | None = None,
+):
+    """Helper to assert that the average mismatch KL over the last N steps is within a threshold"""
+    pattern = r"Mismatch KL:?\s+(\d+\.\d{4})"
+    step_lines = [line for line in lines if "SUCCESS" in line and "Step" in line and re.search(pattern, line)]
+    assert len(step_lines) >= last_n_steps, (
+        f"Not enough step lines found. Expected at least {last_n_steps}, got {len(step_lines)}"
+    )
+
+    recent_lines = step_lines[-last_n_steps:]
+    kl_values = []
+    for line in recent_lines:
+        match = re.search(pattern, line)
+        assert match is not None, f"Could not find Mismatch KL in line: {line}"
+        kl_values.append(float(match.group(1)))
+
+    avg_kl = sum(kl_values) / len(kl_values)
+    if min_threshold is not None:
+        assert avg_kl >= min_threshold, (
+            f"Average mismatch KL over last {last_n_steps} steps did not reach minimum threshold. "
+            f"Found avg_kl={avg_kl:.4f} < {min_threshold} (kl_values={kl_values})"
+        )
+    if max_threshold is not None:
+        assert avg_kl <= max_threshold, (
+            f"Average mismatch KL over last {last_n_steps} steps exceeded maximum threshold. "
+            f"Found avg_kl={avg_kl:.4f} > {max_threshold} (kl_values={kl_values})"
+        )
+
+
+def check_mismatch_kl_in_range(
+    lines: list[str],
+    step: int = -1,
+    min_threshold: float | None = None,
+    max_threshold: float | None = None,
+):
+    """Helper to assert that mismatch KL in step logs is within a threshold"""
+    check_metric_in_range(
+        lines,
+        metric_name="Mismatch KL",
+        pattern=r"Mismatch KL:?\s+(\d+\.\d{4})",
+        step=step,
+        min_threshold=min_threshold,
+        max_threshold=max_threshold,
+    )
+
+
+def convert_checkpoint(converter: str, *args: Path) -> None:
+    """Run ``tools/convert_<converter>.py`` on a checkpoint."""
+    import subprocess
+
+    cmd = ["uv", "run", "python", f"tools/convert_{converter}.py", *[str(arg) for arg in args]]
+    subprocess.run(cmd, check=True, timeout=600)
+
+
+def check_hf_load(weights_dir: Path) -> None:
+    """Helper to assert that an exported checkpoint loads as an HF model with no missing/unexpected tensors"""
+    import torch
+    from transformers import AutoModelForCausalLM
+
+    model, loading_info = AutoModelForCausalLM.from_pretrained(weights_dir, output_loading_info=True)
+    assert not loading_info["missing_keys"], f"missing keys: {loading_info['missing_keys'][:5]}"
+    assert not loading_info["unexpected_keys"], f"unexpected keys: {loading_info['unexpected_keys'][:5]}"
+    assert not loading_info["mismatched_keys"], f"mismatched keys: {loading_info['mismatched_keys'][:5]}"
+    assert all(torch.isfinite(param).all() for param in model.parameters())

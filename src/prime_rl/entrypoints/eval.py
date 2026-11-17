@@ -1,0 +1,202 @@
+"""Launcher for ``uv run eval``: one epoch of every configured eval source.
+
+Defers heavy ML imports until after the config is parsed, so ``eval --help``
+short-circuits. The implementation lives in ``prime_rl.eval.eval``.
+"""
+
+import asyncio
+import json
+import os
+import re
+import signal
+import sys
+import threading
+import tomllib
+from pathlib import Path
+from subprocess import Popen
+from typing import Any
+
+from prime_rl.configs.eval import EvalConfig
+from prime_rl.utils.config import check_mode, cli, config_files, dump_resolved_config
+from prime_rl.utils.process import DEFAULT_COMMON_ENV_VARS, cleanup_processes, set_proc_title
+
+USAGE = """\
+usage: uv run eval [<taskset-id>] [--env.<field> <value> ...] [-n N] [-s] [-r N] [-c N] [-m MODEL] [options]
+       uv run eval @ eval.toml [options]                                  multi-source runs ([[source]] blocks)
+       uv run eval @ eval.toml --run.name <name> --resume                 resume an interrupted run
+
+Shorthands:
+  <taskset-id>             the taskset of the run's only source
+  --env.<field> <value>    a field of that source's env block (e.g. --env.agent.harness.id bash); next to a
+                           TOML with [[source]] blocks, a field of the shared env block (e.g. --env.retries.max-retries 3)
+  -c N                     pin the concurrency band (concurrency.min_inflight = max_inflight = N)
+"""
+
+NUMBER = re.compile(r"-?\d+(\.\d+)?")
+
+
+def set_nested(target: dict[str, Any], keys: list[str], value: Any) -> None:
+    for key in keys[:-1]:
+        target = target.setdefault(key, {})
+    target[keys[-1]] = value
+
+
+def parse_value(raw: str) -> Any:
+    """A JSON list/object stays structured; every other value is left to pydantic."""
+    return json.loads(raw) if raw.startswith(("[", "{")) else raw
+
+
+def expand_shorthands(argv: list[str]) -> list[str]:
+    """Rewrite the shorthands into flags ``EvalConfig`` parses.
+
+    ``<taskset-id>`` and ``--env.<path> <value>`` describe the run's only source and fold
+    into one JSON ``--source`` flag (pydantic-config has no list-index paths, so
+    ``--source.0.env...`` cannot address it). Next to a config file that defines
+    ``[[source]]`` blocks, ``--env.*`` flags pass through to the shared ``env`` block.
+    ``-c N`` pins the concurrency band. Everything else passes through untouched.
+    """
+    out: list[str] = []
+    source: dict[str, Any] = {}
+    rest = list(argv)
+    positional = bool(rest) and not rest[0].startswith(("-", "@"))
+    sources_in_toml = any(toml_defines_source(path) for path in config_files(argv))
+    shared_env = sources_in_toml and not positional
+    if positional:
+        set_nested(source, ["env", "taskset", "id"], rest.pop(0))
+    i = 0
+    while i < len(rest):
+        arg = rest[i]
+        flag, has_value, value = arg.partition("=")
+        if not has_value and (flag.startswith("--env.") or flag == "-c"):
+            if i + 1 >= len(rest) or (rest[i + 1].startswith("-") and not NUMBER.fullmatch(rest[i + 1])):
+                raise SystemExit(f"{flag} needs a value")
+            i += 1
+            value = rest[i]
+        if flag.startswith("--env.") and shared_env:
+            out += [flag, value]
+        elif flag.startswith("--env."):
+            set_nested(source, [key.replace("-", "_") for key in flag[2:].split(".")], parse_value(value))
+        elif flag == "-c":
+            out += ["--concurrency.min_inflight", value, "--concurrency.max_inflight", value]
+        else:
+            out.append(arg)
+        i += 1
+    if source:
+        if sources_in_toml:
+            raise SystemExit(
+                "The <taskset-id> shorthand describes a single source and cannot be combined "
+                "with a config file that defines [[source]] blocks - use one or the other"
+            )
+        out += ["--source", json.dumps([source])]
+    return out
+
+
+def toml_defines_source(path: Path) -> bool:
+    if path.suffix != ".toml" or not path.is_file():
+        return False
+    with path.open("rb") as f:
+        return "source" in tomllib.load(f)
+
+
+def main():
+    set_proc_title("Eval")
+    argv = sys.argv[1:]
+    check_mode("eval", argv)
+    if not argv or any(arg in ("-h", "--help") for arg in argv):
+        print(USAGE)
+        sys.argv = [sys.argv[0], "--help"]
+        cli(EvalConfig)
+        return
+    # The typed parse sees the expanded flags; the launch artifacts keep the command as typed.
+    sys.argv = [sys.argv[0], *expand_shorthands(argv)]
+    config = cli(EvalConfig)
+    sys.argv = [sys.argv[0], *argv]
+
+    from prime_rl.entrypoints.dashboard import ensure_dashboard, log_run_links, run_links
+    from prime_rl.utils.logger import setup_logger
+    from prime_rl.utils.pathing import (
+        format_config_message,
+        format_log_message,
+        prepare_attempt_dirs,
+        prepare_run,
+        write_env_worker_pool_config,
+        write_launch_artifacts,
+    )
+
+    # The run identity is stamped on every episode and inherited by the env worker pools.
+    prepare_run(config)
+    config_dir, log_dir = prepare_attempt_dirs(config.run_dir)
+    os.environ["PRL_ATTEMPT_CONFIG_DIR"] = str(config_dir)
+    os.environ["PRL_ATTEMPT_LOG_DIR"] = str(log_dir)
+    log_file = log_dir / "eval.log"
+    logger = setup_logger(config.log.level, json_logging=config.log.json_logging, log_file=log_file)
+    logger.info("Starting eval")
+
+    write_launch_artifacts(config_dir, "eval")
+    (config_dir / "eval.json").write_text(json.dumps(dump_resolved_config(config), indent=2))
+    components: list[tuple[str, Path | str]] = [("Eval", config_dir / "eval.json")]
+    # One env worker pool per source without an explicit `serve.address`, like the rl launcher's:
+    # `env-worker-pool @ <path>` binds an OS-assigned port and publishes it to the source's
+    # address file, where the eval picks it up.
+    env_worker_pools = [source for source in config.source if source.serve.address is None]
+    env_names = [source.resolved_name for source in env_worker_pools]
+    if env_worker_pools:
+        components.append(("Envs", f"{config_dir}/envs/eval/*.json"))
+        for source in env_worker_pools:
+            components.append(
+                (f" {source.resolved_name}", write_env_worker_pool_config(config_dir, "eval", source, config.log))
+            )
+    if config.dry_run:
+        logger.info(f"Configs:\n{format_config_message(config_dir, 'eval', components)}")
+        logger.success("Dry run complete. To start the eval, remove --dry-run from your command.")
+        return
+
+    dashboard_url = ensure_dashboard(config.output_dir, logger) if config.dashboard else None
+    from prime_rl.eval.eval import run_eval
+
+    processes: list[Popen] = []
+    for source in env_worker_pools:
+        name = source.resolved_name
+        logger.info(f"Starting {name} env worker pool")
+        env_worker_pool_log = log_dir / "envs" / "eval" / f"{name}.log"
+        env_worker_pool_log.parent.mkdir(parents=True, exist_ok=True)
+        with open(env_worker_pool_log, "w") as log_file_handle:
+            processes.append(
+                Popen(
+                    ["env-worker-pool", "@", (config_dir / "envs" / "eval" / f"{name}.json").as_posix()],
+                    env={**os.environ, **DEFAULT_COMMON_ENV_VARS},
+                    stdout=log_file_handle,
+                    stderr=log_file_handle,
+                )
+            )
+
+    logger.info(f"Configs:\n{format_config_message(config_dir, 'eval', components)}")
+    logger.info(format_log_message(log_dir, eval=True, env_names={"eval": env_names}))
+
+    def sigterm_handler(signum, frame):
+        logger.warning("Received SIGTERM, terminating all processes...")
+        cleanup_processes(processes)
+        sys.exit(1)
+
+    signal.signal(signal.SIGTERM, sigterm_handler)
+
+    # Like the rl/sft launchers, the console stays quiet while the eval runs: results
+    # live in the dashboard and the log file, only errors surface here.
+    setup_logger(config.log.level, json_logging=config.log.json_logging, log_file=log_file, console_level="ERROR")
+    # Each source's Prime evaluation opens once the eval counts its tasks, so the
+    # banner waits for the links next to the running eval.
+    eval_done = threading.Event()
+    links = run_links(config.run_dir, log_dir, config.monitors, eval_done.is_set)
+    banner = threading.Thread(target=log_run_links, args=(dashboard_url, links), daemon=True)
+    banner.start()
+    try:
+        asyncio.run(run_eval(config))
+    finally:
+        eval_done.set()
+        banner.join()
+        cleanup_processes(processes)
+    setup_logger(config.log.level, json_logging=config.log.json_logging, log_file=log_file).success("Eval finished!")
+
+
+if __name__ == "__main__":
+    main()

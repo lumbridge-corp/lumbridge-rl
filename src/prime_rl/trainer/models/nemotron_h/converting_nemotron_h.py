@@ -1,0 +1,72 @@
+from torch import Tensor
+
+from prime_rl.trainer.models.conversion_ops import ConvOp, Drop, PrefixRename, Rename, Stack
+from prime_rl.trainer.models.nemotron_h.configuration_nemotron_h import NemotronHConfig, NemotronHOmniConfig
+
+
+def is_hf_state_dict(state_dict: dict[str, Tensor]) -> bool:
+    return (
+        "backbone.embeddings.weight" in state_dict
+        or "language_model.backbone.embeddings.weight" in state_dict
+        or any(".mixer." in name for name in state_dict)
+    )
+
+
+def is_prime_state_dict(state_dict: dict[str, Tensor]) -> bool:
+    return "model.embed_tokens.weight" in state_dict or any(
+        namespace in name for name in state_dict for namespace in (".mamba.", ".self_attn.", ".mlp.router.")
+    )
+
+
+def conversion_chain(config: NemotronHConfig | NemotronHOmniConfig) -> list[ConvOp]:
+    ops: list[ConvOp] = []
+    if config.model_type == "nemotron_h_omni":
+        ops.extend(
+            [
+                Drop("vision_model.", is_prefix=True),
+                Drop("vision_projector.", is_prefix=True),
+                Drop("mlp1.", is_prefix=True),
+                PrefixRename("language_model.", ""),
+            ]
+        )
+        config = config.text_config
+    ops.extend(
+        [
+            PrefixRename("backbone.", "model."),
+            Drop("mtp.", is_prefix=True),
+            Rename("model.embeddings.weight", "model.embed_tokens.weight"),
+            Rename("model.norm_f.weight", "model.norm.weight"),
+        ]
+    )
+
+    for layer_idx, layer_type in enumerate(config.layer_types):
+        prefix = f"model.layers.{layer_idx}"
+        if layer_type == "linear_attention":
+            ops.append(PrefixRename(f"{prefix}.mixer.", f"{prefix}.mamba."))
+        elif layer_type == "full_attention":
+            ops.append(PrefixRename(f"{prefix}.mixer.", f"{prefix}.self_attn."))
+        elif layer_type == "moe":
+            ops.extend(
+                [
+                    Rename(f"{prefix}.mixer.gate.weight", f"{prefix}.mlp.router.gate.weight"),
+                    Rename(
+                        f"{prefix}.mixer.gate.e_score_correction_bias",
+                        f"{prefix}.mlp.router.selection_bias",
+                    ),
+                    Stack(
+                        stacked=f"{prefix}.mlp.experts.up_proj",
+                        item=f"{prefix}.mixer.experts.{{e}}.up_proj.weight",
+                    ),
+                    Stack(
+                        stacked=f"{prefix}.mlp.experts.down_proj",
+                        item=f"{prefix}.mixer.experts.{{e}}.down_proj.weight",
+                    ),
+                    PrefixRename(f"{prefix}.mixer.shared_experts.", f"{prefix}.mlp.shared_expert."),
+                    PrefixRename(f"{prefix}.mixer.fc1_latent_proj.", f"{prefix}.mlp.fc1_latent_proj."),
+                    PrefixRename(f"{prefix}.mixer.fc2_latent_proj.", f"{prefix}.mlp.fc2_latent_proj."),
+                ]
+            )
+    return ops
+
+
+__all__ = ["conversion_chain", "is_hf_state_dict", "is_prime_state_dict"]

@@ -1,0 +1,21 @@
+# 5-step LoRA SFT on fake data with Nemotron 3.5 Bolt-E4B (Gemma 4 layout, lumbridge adapter).
+# Proves the adapter loads through DCP, shards with FSDP and trains next to the resident Bolt on a DGX Spark.
+max_steps = 5
+
+[model]
+name = "nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-BF16"
+compile = "None"
+ac = "None"
+optimization_dtype = "bfloat16"
+reduce_dtype = "bfloat16"
+
+[model.lora]
+rank = 16
+alpha = 32
+# Language model only; the vision and audio towers stay frozen.
+target_modules = ['model\.language_model\.layers\.\d+\.(self_attn\.(q|k|v|o)_proj|mlp\.(gate|up|down)_proj)$']
+
+[data]
+type = "fake"
+batch_size = 2
+seq_len = 1024

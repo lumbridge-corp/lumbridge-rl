@@ -1,0 +1,90 @@
+from pathlib import Path
+from typing import Callable
+
+import pytest
+
+from tests.conftest import ProcessResult
+from tests.integration.dashboard_smoke import make_dashboard_test
+from tests.utils import (
+    check_avg_mismatch_kl_in_range,
+    check_no_error,
+    check_reward_goes_up,
+    check_reward_in_range,
+    strip_escape_codes,
+)
+
+pytestmark = [pytest.mark.gpu, pytest.mark.slow]
+
+RUN_NAME = "alphabet-sort"
+
+
+@pytest.fixture(scope="module")
+def run_dir(output_dir: Path) -> Path:
+    return output_dir / RUN_NAME
+
+
+TIMEOUT = 1200  # 20 minutes (was 900s — alphabet-sort steps can take 2+ min
+# each on contended CI GPU runners, and vLLM warm-up eats ~2 min)
+
+
+@pytest.fixture(scope="module")
+def wandb_name(branch_name: str) -> str:
+    """Fixture for W&B name for alphabet sort RL CI integration tests."""
+    return f"test-alphabet-sort:{branch_name}"
+
+
+@pytest.fixture(scope="module")
+def rl_process(
+    run_process: Callable[..., ProcessResult],
+    output_dir: Path,
+    wandb_project: str,
+    wandb_name: str,
+) -> ProcessResult:
+    cmd = [
+        "uv",
+        "run",
+        "rl",
+        "@",
+        "configs/ci/integration/alphabet_sort.toml",
+        "--clean",
+        "--monitors.wandb.project",
+        wandb_project,
+        "--monitors.wandb.name",
+        wandb_name,
+        "--no-monitors.prime",
+        "--output-dir",
+        output_dir.as_posix(),
+        "--run.name",
+        RUN_NAME,
+    ]
+    return run_process(cmd, timeout=TIMEOUT)
+
+
+@pytest.fixture(scope="module")
+def test_no_error(rl_process: ProcessResult, run_dir: Path):
+    """Tests that the RL process does not fail."""
+    check_no_error(rl_process, run_dir)
+
+
+def test_reward_goes_up(rl_process: ProcessResult, test_no_error, run_dir: Path):
+    """Tests that the reward goes up in the RL process."""
+    with open(run_dir / "logs" / "latest" / "orchestrator.log", "r") as f:
+        orchestrator_stdout = strip_escape_codes(f.read()).splitlines()
+    check_reward_goes_up(orchestrator_stdout)
+
+
+def test_reward_in_range(rl_process: ProcessResult, test_no_error, run_dir: Path):
+    """Tests that the reward is in range in the RL process."""
+    with open(run_dir / "logs" / "latest" / "orchestrator.log", "r") as f:
+        orchestrator_stdout = strip_escape_codes(f.read()).splitlines()
+    check_reward_in_range(orchestrator_stdout, min_threshold=0.10)
+
+
+def test_mismatch_kl_in_range(rl_process: ProcessResult, test_no_error, run_dir: Path):
+    """Tests that the average mismatch KL is below 0.15 across the last 5 steps."""
+    with open(run_dir / "logs" / "latest" / "trainer.log", "r") as f:
+        trainer_stdout = strip_escape_codes(f.read()).splitlines()
+    check_avg_mismatch_kl_in_range(trainer_stdout, last_n_steps=5, max_threshold=0.15)
+
+
+test_dashboard = make_dashboard_test("rl_process", RUN_NAME)

@@ -1,0 +1,240 @@
+# Advanced
+
+This page covers the specialized features layered on top of the core training stack: our custom model implementations (with EP for MoE families and CP for long-context training), multimodal training, LoRA training, and disaggregated prefill/decode inference. For developer-side workflows (adding new model architectures, debugging modeling code at small scale), see [Development](development.md).
+
+## Table of Contents
+
+- [Custom Modeling](#custom-modeling)
+  - [Router Precision](#router-precision)
+  - [LM Head Precision](#lm-head-precision)
+  - [Expert Parallelism Backends](#expert-parallelism-backends)
+  - [Runtime Fusions](#runtime-fusions)
+- [Multimodal Training](#multimodal-training)
+  - [Supported Families](#supported-families)
+  - [Enabling VLM Mode](#enabling-vlm-mode)
+  - [Limitations](#limitations)
+- [LoRA Training](#lora-training)
+- [Disaggregated Prefill/Decode Inference](#disaggregated-prefilldecode-inference)
+
+## Custom Modeling
+
+The trainer only runs `prime-rl`'s own model implementations, selected from the HF config type. Besides dense Llama, Qwen3 and Qwen3.5, these cover the families below. Other architectures fail at trainer setup.
+
+| Family | HF config types | EP | CP |
+|---|---|---|---|
+| GLM-5 / GLM-5.2 (`glm_moe_dsa`) | `zai-org/GLM-5`, `zai-org/GLM-5-FP8`, `zai-org/GLM-5.2`, `zai-org/GLM-5.2-FP8` | ✅ | ✅ |
+| GLM-5.3 Flash, text only (`glm5_next`) | `zai-org/GLM-5.3-Flash-BF16` | ✅ | ✅ |
+| Qwen3 MoE | `Qwen/Qwen3-30B-A3B`, … | ✅ | ✅ |
+| Qwen3.5 MoE | `Qwen/Qwen3.5-35B-A3B`, … | ✅ | ✅ |
+| Qwen3.5 VLMs | see [Multimodal training](#multimodal-training) | MoE only | ✅ |
+| Qwen3.8 Flash Next VLM | `Qwen/Qwen3.8-Flash-Next` | ✅ | ✅ |
+| Laguna | `poolside/Laguna-XS.2` | ✅ | ✅ |
+| MiniMax M2 | `MiniMax/MiniMax-M2` | ✅ | ✅ |
+| Muse Glimmer (text only) | `meta-models/Muse-Glimmer-30B` | — | ✅ |
+| Nemotron H | `nvidia/Nemotron-3-Nano-30B-A3B`, … | ✅ | ❌ |
+| Trinity (AFMoE) | `arcee-ai/Trinity-Mini`, … | ✅ | ✅ |
+| GLM-4 / GLM-4.5 / INTELLECT-3 | `THUDM/GLM-4-9B-0414`, `zai-org/GLM-4.5`, `PrimeIntellect/INTELLECT-3`, … | ✅ | ✅ |
+| GPT-OSS | `unsloth/gpt-oss-20b-BF16`, … | ✅ | ✅ |
+| DeepSeek V4 | `deepseek-ai/DeepSeek-V4-Flash-0731` | ✅ | ✅ |
+
+GPT-OSS uses FlashAttention 4 with learned attention sinks. Training requires SM90 or SM100/SM110 GPUs
+and a BF16 checkpoint such as `unsloth/gpt-oss-20b-BF16`; the original MXFP4 checkpoints are not supported.
+
+### Low-precision training
+
+Dense linear precision and routed-expert precision are configured independently. `[trainer.model.quantization]` applies only to dense `Linear` modules:
+
+- `type = "fp8"` — DeepGEMM FP8 blockwise linears (requires SM90 or SM100).
+- `type = "mxfp8"` — torchao MXFP8 linears (requires SM100). `recipe` is `mxfp8_rceil` or `mxfp8_rceil_wgrad_with_hp`.
+
+Both skip `lm_head`, the router and a few gate/projection modules by default (`ignore_patterns`). Add model-specific modules with `extra_ignore_patterns`, which keeps the defaults; setting `ignore_patterns` replaces them.
+
+`[trainer.model.moe.compute]` selects routed-expert compute independently:
+
+- `type = "bf16"` (default), with `backend = "torch"` (default) or `"sonicmoe"`.
+- `type = "deepgemm_fp8"` (uses the DeepGEMM bundled with vLLM, `vllm.third_party.deep_gemm`; requires SM90 or SM100)
+- `type = "mxfp8"` (requires `prime-kernels`, torchao, and SM100)
+
+SonicMoE uses the upstream `sonic-moe` package (`uv sync --extra sonic-moe`) for fused BF16 expert computation. The supported model is Qwen3 MoE with the `gate_up` model fusion enabled. Backend selection requires fused gate/up weights, standard SwiGLU, and bias-free experts; incompatible expert structures raise an error during setup. It uses the same router and local, torch EP, or DeepEP dispatch as other compute backends:
+
+```toml
+[trainer.model]
+name = "Qwen/Qwen3-30B-A3B"
+ep = 2
+
+[trainer.model.fusions]
+enabled = ["gate_up"]
+
+[trainer.model.moe.compute]
+type = "bf16"
+backend = "sonicmoe"
+
+[trainer.model.moe.dispatch]
+type = "torch"
+```
+
+```toml
+[trainer.model.quantization]
+type = "mxfp8"
+recipe = "mxfp8_rceil"
+
+[trainer.model.moe.compute]
+type = "mxfp8"
+recipe = "mxfp8_rceil"
+
+[trainer.model.moe.dispatch]
+type = "torch"
+transport = "mxfp8"
+```
+
+All MoE compute backends accept `apply_to`:
+
+- `"all"` (default) applies the backend to all expert groups.
+- `"85%"` applies it to the first 85% of model layers, rounded down. For a 48-layer model, this selects layers 0–39.
+- `[0, 1, 2, 3]` selects explicit zero-based model layer indices; `[]` selects none.
+
+Percentages must be between 0% and 100%; explicit indices must be within the model's layer count. Non-MoE blocks in hybrid models count toward layer indices and percentages. Each selected layer uses the backend for all its routed experts. Other expert groups use BF16 compute and BF16 token transport while retaining the configured dispatch backend and expert parallelism. Dense linear quantization is configured separately.
+
+For example, this selects routed experts in Qwen3's first four model layers:
+
+```toml
+[trainer.model.moe.compute]
+type = "mxfp8"
+apply_to = [0, 1, 2, 3]
+```
+
+Backend shape checks and token alignment apply only to the selected compute path.
+
+In RL runs, configure the same precision selection for rollouts. Inference module names can differ from the trainer's names, and inference precision is configured explicitly, not inferred from `apply_to`. Check the selected modules on both sides before comparing trainer and rollout logprobs.
+
+GLM-5.2 adds IndexShare: the DSA sparse-attention indexer runs only on a subset of layers and the remaining layers reuse the cached top-k indices. The trainer reads this schedule from the model's `indexer_types` config field and enables the index cache automatically, so no extra config is needed.
+
+### Router precision
+
+Router gates use BF16 operands and share the transformer block's FSDP unit. Logits are produced in FP32 directly from the gate GEMM;
+score functions, normalization and routing weights remain FP32.
+
+For models that weight expert outputs after expert computation, local and Torch EP dispatch multiply
+by FP32 routing weights and sum the contributions in FP32, then cast once to the expert output dtype.
+This also covers MXFP8 expert compute with Torch dispatch. With DeepEP, each rank sums its experts'
+outputs for a token in FP32 and casts once, then DeepEP's combine adds these per-rank BF16 sums in FP32
+(across nodes, after summing each node's ranks in FP32 and casting to BF16). MegaMoE uses its own combine
+kernels and does not share this accumulation guarantee.
+
+### LM head precision
+
+The LM head computes FP32 logits from its BF16 operands: one GEMM writes the logits in FP32 instead of rounding them to BF16 (fused and vanilla head). Gradients stay BF16. This matches inference, whose `enable_fp32_lm_head` defaults to `true` (vLLM's FP32 head), and lowers the trainer–inference mismatch.
+
+### Expert Parallelism Backends
+
+`[trainer.model.moe.dispatch]` selects how routed tokens are dispatched and combined:
+
+- **`torch`** (default): torch all-to-all with `transport = "bf16"` or, when MXFP8 expert compute is selected, `transport = "mxfp8"` on SM100.
+- **`deepep`**: DeepEP custom dispatch/combine kernels. `num_sms` (default 32) is the number of SMs its kernels take from compute. DeepEP runs one communication channel per two SMs, so more SMs move tokens faster. Pre-built H100/H200 binaries use CUDA 13.0 and are installed by `uv sync --all-extras`.
+
+```toml
+[trainer.model.moe.dispatch]
+type = "deepep"
+num_sms = 32
+```
+
+### Runtime Fusions
+
+`model.fusions` packs parameters that are always computed together into one tensor, turning several GEMMs into one. Both fusions are on by default:
+
+- `gate_up` — each gated MoE expert's `gate_proj` and `up_proj` become one `[num_experts, 2 * intermediate_size, hidden_size]` weight, halving the routed-expert grouped GEMMs.
+- `qkv` — an attention layer's `q_proj`, `k_proj` and `v_proj` (and their biases) become one linear layer.
+
+```toml
+[trainer.model.fusions]
+enabled = ["gate_up", "qkv"]   # [] disables
+```
+
+Fusions are runtime-only. Checkpoints keep the canonical parameter names and shapes, so a run can turn a fusion on or off at any point and still load its own checkpoints, and exported weights are unaffected. Only modules that support a fusion are packed; a requested fusion that no module supports logs a warning and is skipped. Fusions are skipped when LoRA is enabled.
+
+Muon receives the packed layout as matrix partitions and orthogonalizes each logical matrix on its own, so a packed parameter trains exactly as the parameters it replaces would — including per-projection learning-rate scaling for grouped-query attention — while keeping a single momentum tensor.
+
+The experimental `shard_fused_on_dim1 = true` shards fused 2-D weights along dim 1 under FSDP, which makes weight loading and checkpointing zero-copy: fused weights and their optimizer state are read and written in place rather than assembled into a full copy on each rank first. It requires `hidden_size` to be divisible by the FSDP shard mesh size.
+
+## Multimodal Training
+
+### Supported Families
+
+The built-in VLM registry covers:
+
+| Family | `model_type` |
+|---|---|
+| Qwen3.5 | `qwen3_5` |
+| Qwen3.5-MoE | `qwen3_5_moe` |
+| Qwen3.8 Flash Next | `qwen4_exp` |
+
+The trainer finds the vision encoder at `model.visual` and the language model at `model.language_model`.
+
+Text-only checkpoints of these families set `language_model_only: true` in `config.json` and ship no `model.visual` weights. The trainer then builds no vision encoder. vLLM does not read this field, so for `rl` also set `inference.vllm.language_model_only = true`.
+
+### Enabling VLM Mode
+
+Add `[model.vlm]` to your RL or SFT config:
+
+```toml
+[model]
+name = "Qwen/Qwen3.5-4B"
+
+[model.vlm]
+# freeze_vision_encoder = true  # default; set false to fine-tune the encoder
+```
+
+For `rl`, set `[model.vlm]` in the shared `[model]` block.
+
+VLM training requires a registered custom PrimeRL implementation.
+
+### Limitations
+
+- **Vision encoder frozen by default.** The default LoRA targets do not match Qwen3.5 vision modules. Set `freeze_vision_encoder = false` to fine-tune the encoder; this is incompatible with LoRA because LoRA freezes all non-adapter parameters.
+- **Precision settings are separate.** The examples serve with `inference.vllm.dtype = "bfloat16"` while retaining `trainer.model.optimization_dtype = "float32"` and `reduce_dtype = "float32"`. VLM mode does not require BF16 optimizer state or gradient reduction.
+- **Monitor trainer–inference mismatch.** Image encoding, parallel reductions and model kernels can contribute numerical differences. Track `mismatch_kl/all/mean`, `masked_mismatch_kl/mean`, `unmasked_mismatch_kl/mean` and `is_masked/mean` alongside reward.
+- **Images aren't logged to monitors.** Sample logging captures the prompt text but not the actual images.
+
+## LoRA Training
+
+LoRA is enabled by adding `[model.lora]`:
+
+```toml
+[model.lora]
+rank = 16
+alpha = 32
+dropout = 0.0
+```
+
+`target_modules` defaults to a reasonable cross-family set (`q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`, `experts`, plus a few latent-projection names for Nemotron). Unknown names are silently ignored, so the defaults work across architectures. Add architecture-specific names to extend coverage (e.g. `in_proj` / `out_proj` for Mamba).
+
+LoRA is supported across SFT and RL. NCCL weight broadcast is **not** supported with LoRA — the default NCCL transport automatically falls back to filesystem when LoRA is enabled. Broadcast dirs of LoRA runs contain the raw adapter (`adapter_model.safetensors` + `adapter_config.json`). With LoRA on, the inference server registers the adapter under the model name and serves the base model as `<model>-base`.
+
+## Disaggregated Prefill/Decode Inference
+
+For large MoE serving, splitting prefill and decode onto separate vLLM groups can substantially improve throughput. Pick the prefill:decode ratio based on workload shape:
+
+| Workload | P:D ratio | Why |
+|---|---|---|
+| Agentic (SWE, Lean) | 3:1 | Long growing contexts → prefill-heavy |
+| Non-agentic (math, chat) | 1:2 | Short prompts, long generations → decode-heavy |
+
+Example config: [`examples/advanced/glm-5.3/swe.toml`](https://github.com/PrimeIntellect-ai/prime-rl/blob/main/examples/advanced/glm-5.3/swe.toml) — full RL run on `GLM-5` with P/D disaggregation behind a `vllm-router`, FP8 inference, and NCCL weight broadcast, paired with an inference config from [`examples/advanced/glm-5.3/infer/`](https://github.com/PrimeIntellect-ai/prime-rl/tree/main/examples/advanced/glm-5.3/infer).
+
+Monitor live queue depths to detect imbalance:
+
+```bash
+curl -s http://<prefill_node>:8100/metrics | grep num_requests_waiting
+curl -s http://<decode_node>:8200/metrics | grep num_requests_waiting
+```
+
+If prefill queues and decode is idle, add prefill nodes (and vice versa).
+
+**Required setup for disaggregated P/D (NIXL/UCX).** The pip-wheel NIXL's bundled UCX segfaults on the prefill→decode KV transfer (`signal 11: invalid permissions for mapped object` in `libucs.so`) — reproduced on vLLM 0.22 and 0.23, with/without mooncake, with/without llm-d. Building NIXL against UCX 1.19.x from source is therefore **required** (not optional) for disaggregated P/D.
+
+```bash
+salloc -N 1 --gres=gpu:1 bash -c 'bash scripts/install_nixl_from_source.sh'
+uv pip install --reinstall --no-deps deps/nixl_cu13-*.whl
+```
+
+The script writes UCX 1.19 to `third_party/ucx/`; the bundled sbatch templates prepend it to `LD_LIBRARY_PATH` so it overrides the system version. Re-run both commands after every `uv sync`, since the lock pins the wheel.

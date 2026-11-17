@@ -1,0 +1,21 @@
+{
+    "$schema": "https://mintlify.com/docs.json",
+    "navigation": [
+        {
+            "group": "prime-rl",
+            "pages": [
+                "overview",
+                "configuration",
+                "training",
+                "eval",
+                "inference",
+                "scaling",
+                "model-express",
+                "algorithms",
+                "ipo",
+                "advanced",
+                "development"
+            ]
+        }
+    ]
+}

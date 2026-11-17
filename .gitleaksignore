@@ -1,0 +1,4 @@
+# Checked by hand: not secrets. A docstring import line and a variable named kernel_key in upstream code.
+src/prime_rl/trainer/models/glm4_moe/modeling_glm4_moe.py:generic-api-key:276
+src/prime_rl/trainer/models/kernels/cudnn_dsa_patch.py:generic-api-key:146
+src/prime_rl/trainer/models/qwen3_moe/modeling_qwen3_moe.py:generic-api-key:281

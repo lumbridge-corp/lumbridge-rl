@@ -1,0 +1,780 @@
+import warnings
+from collections.abc import Callable
+from pathlib import Path
+from typing import Annotated, Any, Literal, TypeAlias, get_args
+
+import verifiers.v1 as vf
+from pydantic import AliasChoices, BaseModel, Field, SerializeAsAny, TypeAdapter, ValidationError, model_validator
+from pydantic.fields import FieldInfo
+from renderers import AutoRendererConfig, RendererConfig
+from verifiers.v1.configs.agent import agent_config_fields
+
+from prime_rl.configs.algorithm import (
+    AlgoConfig,
+    GRPOAlgoConfig,
+)
+from prime_rl.configs.diff import Frozen, Live
+from prime_rl.configs.env_worker_pool import ServeConfig
+from prime_rl.configs.monitors import MonitorsConfig
+from prime_rl.configs.shared import (
+    BaseModelConfig,
+    ControlConfig,
+    EnvVars,
+    FileSystemWeightBroadcastConfig,
+    GCConfig,
+    HeartbeatConfig,
+    LogConfig,
+    PolicyClientConfig,
+    ResumeConfig,
+    TransportConfig,
+    WeightBroadcastConfig,
+    ZMQTransportConfig,
+)
+from prime_rl.configs.trainer import TokenizerConfig
+from prime_rl.utils.config import BaseConfig, default_output_dir
+
+
+class ModelConfig(BaseModelConfig):
+    client: PolicyClientConfig = Field(default_factory=PolicyClientConfig)
+    """Client of the live deployment (``[orchestrator.model.client]``)."""
+
+
+class TrainSamplingConfig(BaseConfig):
+    temperature: Annotated[float, Live()] = Field(1.0, ge=0, le=2.0)
+    """Sampling temperature."""
+
+    top_p: float = Field(1.0, gt=0, le=1.0)
+    """Nucleus (top-p) sampling for train rollouts. Values below 1.0 truncate the sampling
+    distribution; the ``rl`` entrypoint auto-enables sampling replay so trainer and
+    rollout distributions stay consistent — see docs/inference.md (Sampling Replay)."""
+
+    top_k: int | None = Field(None, ge=1)
+    """Top-k sampling for train rollouts. Truncation triggers sampling replay, and a default top-k
+    is set when only top-p truncates so every replayed support is bounded — see docs/inference.md
+    (Sampling Replay)."""
+
+    max_completion_tokens: Annotated[int | None, Live()] = None
+    """Maximum output tokens per turn. If None, generates until max context length or EOS."""
+
+    logprobs: int | None = Field(None, ge=1)
+    """Record this many top sampler probabilities per token, in addition to its sampled logprob."""
+
+    # Strictly speaking, extra_body is not a sampling parameter, but it is the
+    # easiest way to pass arbitrary extra parameters to the server via verifiers
+    extra_body: Annotated[dict[str, Any], Live()] = {}
+    """Extra body forwarded with each request to the inference server."""
+
+    def truncates_distribution(self) -> bool:
+        return self.top_p < 1.0 or self.top_k is not None
+
+    @model_validator(mode="after")
+    def validate_no_extra_body_truncation(self):
+        """Truncating values must come from the typed fields — the replay policy reads
+        them. Disabled values (``top_k = -1`` / ``min_p = 0.0``) pass, so configs
+        saved with these sentinels re-validate cleanly."""
+        smuggled = [
+            key
+            for key, truncates in (
+                ("top_p", self.extra_body.get("top_p", 1.0) < 1.0),
+                ("top_k", self.extra_body.get("top_k") not in (None, -1, 0)),
+                ("min_p", self.extra_body.get("min_p", 0.0) > 0.0),
+            )
+            if truncates
+        ]
+        if smuggled:
+            raise ValueError(
+                f"extra_body carries truncating {smuggled}; set them as fields on the train "
+                "sampling config instead (they drive sampling replay)."
+            )
+        return self
+
+
+class EnvConfig(BaseConfig):
+    """One environment a run pulls from: the verifiers blocks it composes (``env`` — what
+    runs, ``serve`` — how it's hosted) plus this orchestrator's own per-env knobs."""
+
+    env: SerializeAsAny[vf.EnvConfig] = vf.SingleAgentEnvConfig()
+    """The verifiers environment — which env, its seed taskset, each agent, its knobs. Narrowed to the selected env's config class by the env id, else the taskset id."""
+
+    serve: ServeConfig = ServeConfig()
+    """How this source's env worker pool is hosted. Each replica has a broker endpoint
+    and workers running the source's env configuration. An unset ``address`` lets the
+    launcher start the pool and discover its bound address. Setting ``address`` selects
+    one externally managed pool; the launcher neither writes its config nor starts it."""
+
+    name: str | None = None
+    """Display name for this environment in logs, metrics, and buffer keys. Defaults to the taskset id. Must be unique across all envs in the same group."""
+
+    select: vf.SelectConfig = vf.SelectConfig()
+    """Which of the taskset's tasks this source uses: ``include``/``exclude`` by ``idx``, ``ids``, ``keys`` or ``names``, then ``shuffle``, ``skip`` and ``limit``, applied in that order."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _resolve_env(cls, data):
+        """Narrow ``env`` to the selected env's config class."""
+        return vf.resolve_env_field(data, vf.narrowed_env_annotation(cls))
+
+    @property
+    def env_id(self) -> str:
+        return self.env.env_id or ""
+
+    @property
+    def resolved_name(self) -> str:
+        return self.name or self.env_id
+
+    @model_validator(mode="after")
+    def validate_env(self):
+        if not self.env_id:
+            raise ValueError('no env configured — set env = { taskset = { id = "<id>" } }')
+        if self.resolved_name == "agg":
+            raise ValueError(
+                'Environment name "agg" is reserved for cross-env metric aggregation. Use a different name or id.'
+            )
+        return self
+
+
+def inherit_defaults(defaults: dict[str, Any], source: dict) -> dict:
+    """Fill in one raw source with its group's ``defaults`` (field name to validated
+    group value). A config block such as ``sampling`` is filled in key by key with
+    ``vf.merge_defaults``; a plain value such as ``group_size`` is used only when the
+    source leaves it unset. The source's own values always win, and a block that the
+    source passes as an already-built config is kept as is."""
+    merged = dict(source)
+    for name, value in defaults.items():
+        own = source.get(name)
+        if isinstance(value, BaseModel):
+            if own is None or isinstance(own, dict):
+                merged[name] = vf.merge_defaults(value, own)
+        elif name not in source:
+            merged[name] = value
+    return merged
+
+
+def raw_field(data: dict, name: str, field: FieldInfo) -> tuple[bool, Any]:
+    """Whether raw ``data`` sets field ``name``, under its name or an alias (``-r``
+    arrives as ``r``), and the value it sets."""
+    alias = field.validation_alias
+    keys = [name, *(alias.choices if isinstance(alias, AliasChoices) else [alias] if alias else [])]
+    for key in keys:
+        if isinstance(key, str) and key in data:
+            return True, data[key]
+    return False, None
+
+
+class StandardSamplerConfig(BaseConfig):
+    type: Literal["standard"] = "standard"
+
+
+class DifficultyPoolConfig(BaseConfig):
+    threshold: float
+    """Inclusive maximum reward assigned to this pool."""
+
+    weight: float = Field(ge=0)
+    """Relative per-task sampling weight."""
+
+
+def default_difficulty_pools() -> dict[str, DifficultyPoolConfig]:
+    return {
+        "hard": DifficultyPoolConfig(threshold=0.25, weight=0.2),
+        "normal": DifficultyPoolConfig(threshold=0.75, weight=1.0),
+        "easy": DifficultyPoolConfig(threshold=1.0, weight=0.2),
+    }
+
+
+class DifficultyPoolSamplerConfig(BaseConfig):
+    type: Literal["difficulty_pool"] = "difficulty_pool"
+
+    pools: dict[str, DifficultyPoolConfig] = Field(default_factory=default_difficulty_pools)
+    """Named pools ordered by their reward thresholds."""
+
+    seed: int = 42
+
+    @model_validator(mode="after")
+    def validate_pools(self):
+        if not self.pools:
+            raise ValueError("DifficultyPoolSampler requires at least one pool")
+        thresholds = [pool.threshold for pool in self.pools.values()]
+        if len(set(thresholds)) != len(thresholds):
+            raise ValueError("Difficulty pool thresholds must be unique")
+        if not any(pool.weight > 0 for pool in self.pools.values()):
+            raise ValueError("At least one difficulty pool must have a positive weight")
+        return self
+
+
+TaskSamplerConfig: TypeAlias = Annotated[
+    StandardSamplerConfig | DifficultyPoolSamplerConfig,
+    Field(discriminator="type"),
+]
+
+
+class AdvRangeGateConfig(BaseConfig):
+    type: Literal["advantage_range"] = "advantage_range"
+
+    reject_min: float = 0.0
+    reject_max: float = 0.0
+
+    @model_validator(mode="after")
+    def validate_range(self):
+        if self.reject_min > self.reject_max:
+            raise ValueError("reject_min must be less than or equal to reject_max")
+        return self
+
+
+AdmissionGateConfig: TypeAlias = AdvRangeGateConfig
+
+
+class CurriculumConfig(BaseConfig):
+    sampler: TaskSamplerConfig = Field(default_factory=StandardSamplerConfig)
+    """Task selection policy. The default cycles through the task iterator in source order."""
+
+    gates: dict[str, AdmissionGateConfig] = Field(default_factory=dict)
+    """Named admission policies. Every gate observes every finalized group,
+    and a group trains only when every gate admits it."""
+
+
+class TrainSourceConfig(EnvConfig):
+    sampling: TrainSamplingConfig = TrainSamplingConfig()
+    """Per-env sampling overrides. Unset fields inherit from the group-level train sampling config."""
+
+    ratio: Annotated[float, Live()] = Field(1.0, gt=0)
+    """Sampling weight for this environment in the buffer. Relative weights are normalized to probabilities across envs (e.g. [1, 1] and [0.5, 0.5] are equivalent). Defaults to 1, i.e. equal weight per env."""
+
+    group_size: Annotated[int, Live()] = Field(1, ge=1)
+    """Rollouts generated per example for GRPO group-relative advantages. Overrides the
+    train group's ``group_size`` for this env, so envs can use different sizes. A live
+    change applies to groups drawn after it; open groups keep the size they started with."""
+
+    algo: AlgoConfig = GRPOAlgoConfig()
+    """Training algorithm for this env: sampling plus the per-token training signal
+    (credit assignment and loss routing, fused — its ``type`` names the algorithm).
+    Setting only some params keeps the group's algorithm; a different ``type`` is
+    this env's own algorithm. Frozen except its live fields (the GRPO ``length_penalty``)."""
+
+    curriculum: CurriculumConfig | None = None
+    """User-authored task sampler and admission gates. The default cycles
+    through the taskset and admits every finalized group."""
+
+    @model_validator(mode="after")
+    def validate_policy_sampling(self):
+        if self.algo.rollout_model != "policy":
+            return self
+        # The source owns the distribution replayed by the trainer; agents may
+        # change generation limits and rendering without changing that distribution.
+        agent_options = {"max_tokens", "reasoning_effort", "chat_template_kwargs"}
+        supported = (
+            agent_options
+            | TrainSamplingConfig.model_fields.keys()
+            | {"min_p", "logprobs", "return_token_ids", "cache_salt"}
+        )
+        sampling = vf.SamplingConfig(**self.sampling.model_dump(exclude_none=True))
+        if getattr(sampling, "extra_args", None) == {"prl_replay": self.sampling.truncates_distribution()}:
+            supported.add("extra_args")
+        if unsupported := sampling.model_dump(exclude_none=True).keys() - supported:
+            raise ValueError(
+                f"Policy source '{self.resolved_name}' has unsupported sampling parameters: {sorted(unsupported)}"
+            )
+        for name, agent in agent_config_fields(self.env).items():
+            # An agent with its own client does not sample from the policy.
+            if agent.sampling is None or agent.client is not None:
+                continue
+            if unsupported := agent.sampling.model_dump(exclude_unset=True).keys() - agent_options:
+                raise ValueError(
+                    f"Agent '{name}' in policy source '{self.resolved_name}' sets sampling {sorted(unsupported)}. "
+                    "Set distribution parameters on the source's sampling config; agent sampling only supports "
+                    f"{sorted(agent_options)}."
+                )
+        return self
+
+
+class EvalSourceConfig(EnvConfig):
+    sampling: vf.SamplingConfig = vf.SamplingConfig()
+    """Per-env sampling overrides. Unset fields inherit from the group-level eval sampling config."""
+
+    group_size: int = Field(1, ge=1)
+    """Rollouts generated per example. Used for pass@k estimation (e.g. ``group_size=8`` enables pass@1 through pass@8)."""
+
+
+class OnlineEvalSourceConfig(EvalSourceConfig):
+    """An eval source of a training run: evaluated on a step interval."""
+
+    interval: Annotated[int, Live()] = Field(100, ge=1)
+    """Step interval at which to evaluate this env."""
+
+
+class SourceGroupConfig(BaseConfig):
+    """A list of sources plus defaults for them.
+
+    Any field that both the group and its source type declare (``env``, ``sampling``,
+    ``select``, ``group_size``, ...) is a default. Before validation, each source gets
+    the group's value for every such field that the group sets:
+
+    - a field the source sets itself keeps the source's value;
+    - a nested block is filled in key by key (``vf.merge_defaults``);
+    - a block with a different ``type``/``id`` (e.g. another ``algo``) is the source's
+      alone.
+
+    A field the group leaves unset is not passed on, so each group field must default
+    to the same value as the source field it feeds."""
+
+    env: vf.SharedEnvConfig = vf.SharedEnvConfig()
+    """Env knobs that every source inherits: the fields every env and taskset has, such
+    as ``retries`` and ``timeout``."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def inherit_group_defaults(cls, data: Any) -> Any:
+        """Pass the group's set defaults down into each raw source."""
+        if not isinstance(data, dict) or not isinstance(data.get("source"), list):
+            return data
+        (source_type,) = get_args(cls.model_fields["source"].annotation)
+        defaults: dict[str, Any] = {}
+        for name, field in cls.model_fields.items():
+            if name == "source" or name not in source_type.model_fields:
+                continue
+            is_set, raw = raw_field(data, name, field)
+            if not is_set:
+                continue
+            try:
+                defaults[name] = TypeAdapter(field.rebuild_annotation()).validate_python(raw)
+            except ValidationError:
+                continue  # the group field reports its own errors once, not once per source
+        data["source"] = [
+            inherit_defaults(defaults, source) if isinstance(source, dict) else source for source in data["source"]
+        ]
+        return data
+
+
+class TrainConfig(SourceGroupConfig):
+    source: list[TrainSourceConfig] = Field(default_factory=list)
+    """Training sources."""
+
+    sampling: Annotated[TrainSamplingConfig, Frozen()] = TrainSamplingConfig()
+    """Sampling that every training source inherits."""
+
+    select: vf.SelectConfig = vf.SelectConfig()
+    """Task selection that every training source inherits."""
+
+    group_size: int = Field(1, ge=1)
+    """Rollouts generated per example that every training source inherits unless it
+    sets its own. ``batch_size`` must be divisible by every source's group size."""
+
+    algo: Annotated[AlgoConfig, Frozen()] = GRPOAlgoConfig()
+    """Training algorithm that every training source inherits. Defaults to ``grpo``."""
+
+    @model_validator(mode="after")
+    def validate_unique_env_names(self):
+        env_names = [env.resolved_name for env in self.source]
+        duplicates = [n for n in env_names if env_names.count(n) > 1]
+        if duplicates:
+            raise ValueError(
+                f"Duplicate training environment names: {set(duplicates)}. Each env must have a unique name."
+            )
+        return self
+
+
+class EvalSourcesConfig(SourceGroupConfig):
+    """Eval sources and the defaults they inherit."""
+
+    source: list[EvalSourceConfig] = Field(default_factory=list)
+    """Evaluation sources."""
+
+    sampling: vf.SamplingConfig = Field(default_factory=vf.SamplingConfig)
+    """Sampling that every eval source inherits; can differ from training sampling."""
+
+    select: vf.SelectConfig = vf.SelectConfig()
+    """Task selection that every eval source inherits, e.g. ``limit = 128`` to evaluate
+    128 tasks of each taskset."""
+
+    group_size: int = Field(1, ge=1)
+    """Rollouts per example that every eval source inherits."""
+
+    @model_validator(mode="after")
+    def validate_non_empty_sources(self):
+        if not self.source:
+            raise ValueError(
+                "At least one eval source is required. Add a source block "
+                "(e.g. [[source]] or [[orchestrator.eval.source]]) or drop the eval block entirely to disable eval."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_unique_env_names(self):
+        env_names = [source.resolved_name for source in self.source]
+        duplicates = [n for n in env_names if env_names.count(n) > 1]
+        if duplicates:
+            raise ValueError(
+                f"Duplicate evaluation environment names: {set(duplicates)}. Each env must have a unique name."
+            )
+        return self
+
+
+class ScheduledEvalConfig(EvalSourcesConfig):
+    """Eval sources evaluated on a step interval next to training."""
+
+    source: list[OnlineEvalSourceConfig] = Field(default_factory=list)
+    """Evaluation sources, each with its own step interval."""
+
+    interval: int = Field(100, ge=1)
+    """Step interval that every eval source inherits."""
+
+    skip_first_step: bool = False
+    """If True, skip the startup eval that otherwise runs before any
+    train rollouts."""
+
+    retrigger_on_resume: bool = False
+    """If True, re-trigger evals at the checkpoint step on resume (e.g. after a
+    crash that left in-flight evals unfinished). By default, assumes a clean
+    exit where all evals already completed."""
+
+    @property
+    def intervals(self) -> dict[str, int]:
+        """Step interval per eval env, by resolved name."""
+        return {source.resolved_name: source.interval for source in self.source}
+
+
+class RLOnlineEvalConfig(ScheduledEvalConfig):
+    """The ``[orchestrator.eval]`` block: online evals against the orchestrator's
+    inference pool, on the policy the train rollouts see."""
+
+
+class CheckpointConfig(BaseConfig):
+    interval: int | None = Field(None, ge=1)
+    """Step interval at which to save the orchestrator checkpoint."""
+
+
+class ConcurrencyConfig(BaseConfig):
+    """Adaptive in-flight concurrency control. The orchestrator sizes the
+    in-flight episode cap from engine load; these fields only bound and
+    seed it."""
+
+    initial_inflight: Annotated[int | None, Live()] = Field(None, ge=1)
+    """Optional initial in-flight episodes to start from. Set it when a good value is known to skip the initial ramp; otherwise auto-derive a pessimistic bound at runtime."""
+
+    min_inflight: Annotated[int, Live()] = Field(1, ge=1)
+    """Minimum number of in-flight episodes. Set ``min_inflight = max_inflight`` to recover fixed concurrency."""
+
+    max_inflight: Annotated[int | None, Live()] = Field(None, ge=1)
+    """Maximum number of in-flight episodes. None (the default) leaves the cap to the controller. Set it to bound other external resources the episodes hold (e.g. sandboxes)."""
+
+    @model_validator(mode="after")
+    def validate_bounds(self):
+        if self.max_inflight is not None:
+            if self.initial_inflight is not None and self.initial_inflight > self.max_inflight:
+                raise ValueError("concurrency.initial_inflight must not exceed concurrency.max_inflight")
+            if self.min_inflight > self.max_inflight:
+                raise ValueError("concurrency.min_inflight must not exceed concurrency.max_inflight")
+        return self
+
+
+# Top-k set on truncated policy sampling that has none: the kept ids of every sampled token travel to the
+# trainer, and top-p alone can keep most of the vocabulary on a flat distribution.
+TRAIN_TOP_K_DEFAULT = 10000
+
+
+class OrchestratorControlConfig(ControlConfig):
+    port: int = Field(8041, ge=1, le=65535)
+    """Port the control API listens on, next to the trainer's 8040 on a single node."""
+
+
+class SpeculativeDecodingConfig(BaseConfig):
+    draft: Annotated[Path, Live()]
+    """Draft checkpoint the inference engines serve; at launch, the one they started with. A live update
+    loads the new draft on every engine at the next policy weight sync. It must keep the served draft's
+    architecture and tensor shapes. A failed load restores the previous draft and reverts this value."""
+
+
+class OrchestratorConfig(BaseConfig):
+    model: ModelConfig = ModelConfig()
+    """The model being trained: its model fields plus the client of the live
+    vLLM deployment (``[orchestrator.model] name = ...`` with
+    ``[orchestrator.model.client]``). Algorithm components reference it as
+    ``"policy"``."""
+
+    train: TrainConfig = TrainConfig()
+
+    tokenizer: TokenizerConfig = TokenizerConfig()
+
+    renderer: RendererConfig = AutoRendererConfig()
+    """Typed renderer config (``renderers.RendererConfig`` discriminated union), required —
+    training is renderer-only. Defaults to ``"auto"``, which resolves from
+    ``tokenizer.name_or_path`` via ``MODEL_RENDERER_MAP``. RL/OPD roll out through the renderer
+    client; SFT uses it to backfill tokens for its chat-completions teacher."""
+
+    eval: RLOnlineEvalConfig | None = None
+    """Evaluation configuration."""
+
+    log: LogConfig = LogConfig()
+
+    env_vars: EnvVars = {}
+    """Extra environment variables for the orchestrator process(es). Merged on top of the launcher defaults."""
+
+    monitors: MonitorsConfig = MonitorsConfig()
+    """Metric monitors (``monitors.wandb``, ``monitors.file``, ``monitors.prime``)."""
+
+    collect_inference_metrics: bool = True
+    """Mirror inference-server metrics to W&B (requires wandb). The ``/metrics`` poll itself always runs — it feeds the concurrency controller."""
+
+    inference_metrics_roles: list[Literal["prefill", "decode"]] | None = None
+    """P/D role of each policy admin client: labels inference metrics, and prefill engines pause before decode engines on weight updates."""
+
+    ckpt: CheckpointConfig | None = None
+    """Checkpoint configuration."""
+
+    resume: ResumeConfig | None = None
+    """Resume the orchestrator from a checkpoint. None starts from scratch; an empty block resumes from the latest checkpoint, ``resume.step`` from that step, ``resume.dir`` from an external checkpoint step directory. Without ``ckpt`` the run loads but saves no new checkpoints."""
+
+    weight_broadcast: WeightBroadcastConfig = FileSystemWeightBroadcastConfig()
+    """Transport used to receive updated weights from the trainer."""
+
+    rollout_transport: TransportConfig = ZMQTransportConfig()
+    """Transport used to ship rollouts from orchestrator to trainer."""
+
+    env_worker_pool_replicas: int | None = Field(None, ge=1)
+    """Replicas of each launcher-managed env worker pool, each publishing its address to
+    ``<name>.<replica>.address``; the orchestrator spreads each source's episodes over them,
+    least loaded first. None means one pool publishing to ``<name>.address``. Set by the
+    ``rl`` launcher: multi-node runs start one replica per inference node, so pool
+    memory spreads over all of them."""
+
+    output_dir: Path = Field(default_factory=default_output_dir)
+    """Directory to write outputs to — checkpoints, weights, rollouts, and logs are written as subdirectories. Shared with the trainer; should be a persistent directory with enough disk space and unique per experiment running on a single node. Defaults to ``$PRL_OUTPUT_DIR`` if set, else ``outputs``."""
+
+    dispatch_per_minute: int | None = Field(None, ge=1)
+    """Rate limit on episode dispatch, shared by train and eval: at most this many episodes start per minute. Each episode counts once, so a group of ``group_size`` episodes counts ``group_size`` times. Recommended for sandbox-backed environments to pace provisioning during autoscaling. None disables it."""
+
+    batch_size: Annotated[int, Live()] = Field(128, ge=1)
+    """Samples to train on per step."""
+
+    constant_trainer_batch_size: bool = True
+    """Require each batch to reach its effective sample target."""
+
+    concurrency: ConcurrencyConfig = ConcurrencyConfig()
+    """Adaptive in-flight concurrency control (``[orchestrator.concurrency]``)."""
+
+    gc: GCConfig | None = GCConfig()
+    """Garbage collection config. Freezes the startup heap, turns off automatic full collections (each one holds the GIL and stalls the event loop for as long as it takes to walk every held episode) and runs one every N steps instead. Young collections still run. Set to null to use Python's default GC behavior."""
+
+    seq_len: int = 2048
+    """Training sequence length. Shorter samples are padded; longer samples are truncated."""
+
+    num_train_workers: int = Field(1, ge=1)
+    """Trainer data-parallel world size (trainer world size // cp). The orchestrator packs one micro-batch list per DP rank, so this must match the trainer topology. Auto-filled by the ``rl`` entrypoint; set explicitly for standalone orchestrator runs."""
+
+    pad_to_multiple_of: int = Field(1, ge=1)
+    """Pad each packed micro batch to a multiple of this value (the trainer's cp degree). Auto-filled by the ``rl`` entrypoint; set explicitly for standalone orchestrator runs with cp > 1."""
+
+    pad_to_seq_len: bool = False
+    """Pad every packed micro batch to ``seq_len`` instead of to a multiple of ``pad_to_multiple_of``. Rows then have one static shape, which avoids recompilation on dynamic sequence lengths (torch.compile, DeepGEMM JIT kernels, ...) at the cost of extra padding."""
+
+    max_steps: int | None = None
+    """Maximum training steps. If None, runs indefinitely."""
+
+    max_staleness: Annotated[int, Live()] = Field(8, ge=0)
+    """Maximum token staleness: the version a batch trains on (v{step-1}) minus the policy version that sampled the token, queue time included. Engines label each sampled token with the policy step (vLLM ``weight_versions``); unlabelled tokens (Dynamo engines) count as old as their episode's dispatch version. Older tokens are masked out of every loss component; the rest of the sample still trains with its own advantage and inference logprobs. A sample is dropped only when nothing is left to train. Rollouts are never cancelled for staleness. Higher values yield better throughput at the cost of noisier, more off-policy updates."""
+
+    heartbeat: HeartbeatConfig | None = None
+    """BetterStack heartbeat configuration for monitoring training progress."""
+
+    control: OrchestratorControlConfig | None = None
+    """Serve the orchestrator's control API (pause or checkpoint at a step the trainer
+    accepted, update the config live). If None, it takes no control requests."""
+
+    speculative_decoding: SpeculativeDecodingConfig | None = None
+    """Draft model served by the policy engines. Auto-filled by the ``rl`` entrypoint from the inference
+    servers' speculative config; set it for standalone orchestrator runs that should swap drafts."""
+
+    @model_validator(mode="after")
+    def validate_draft_swaps(self):
+        dynamo = self.model.client.dynamo
+        if self.speculative_decoding is not None and dynamo is not None and dynamo.enabled:
+            raise ValueError("Draft swaps use prime-rl's engine admin routes, which Dynamo deployments do not serve")
+        if self.speculative_decoding is not None and self.weight_broadcast.type == "modelexpress":
+            raise ValueError("Draft swaps load with filesystem, NCCL or NIXL weight broadcasts, not modelexpress")
+        return self
+
+    @model_validator(mode="after")
+    def auto_setup_tokenizer(self):
+        if self.tokenizer.name is None:
+            self.tokenizer.name = self.model.name
+        if self.tokenizer.trust_remote_code is None:
+            self.tokenizer.trust_remote_code = self.model.trust_remote_code
+        return self
+
+    @model_validator(mode="after")
+    def auto_setup_prime_monitor_name(self):
+        """Default ``monitors.prime.name`` to the W&B run name when monitoring
+        is enabled and the user hasn't named the platform run explicitly."""
+        if self.monitors.prime is None or self.monitors.prime.name is not None:
+            return self
+        if self.monitors.wandb is not None and self.monitors.wandb.name:
+            self.monitors.prime.name = self.monitors.wandb.name
+        return self
+
+    @model_validator(mode="after")
+    def validate_env_algorithms(self):
+        """Let each algorithm reject environments it cannot score correctly."""
+        for env_cfg in self.train.source:
+            env_cfg.algo.validate_env(env_cfg.env)
+        return self
+
+    @model_validator(mode="after")
+    def validate_loss_aggregation(self):
+        """The trainer divides the rl loss by the batch's summed rl weights, so token-mean (weight
+        1 per token) and prompt-mean (weight 1 per group) envs can't share a batch."""
+        algos = [env.algo for env in self.train.source if env.algo.action_loss_type == "rl"]
+        aggregations = {algo.loss_aggregation if isinstance(algo, GRPOAlgoConfig) else "token" for algo in algos}
+        if len(aggregations) > 1:
+            raise ValueError(
+                "All train envs with an rl loss must use the same loss_aggregation: a prompt-mean group "
+                "would weigh as much as a single token of a token-mean env."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def setup_truncated_sampling(self):
+        """Truncated policy sampling trains with sampling replay (rollout
+        logprobs are renormalized — see docs/inference.md, Sampling Replay).
+        Owned here: every truncating config gets a top-k (bounds the replayed supports); opd/opsd
+        is rejected (full-vocab prefill refs would mix normalizations). Frozen-source envs sample
+        externally and are exempt."""
+        truncating = [sampling for sampling in self.policy_samplings if sampling.truncates_distribution()]
+        if not truncating:
+            return self
+
+        if any(sampling.temperature == 0 for sampling in truncating):
+            raise ValueError(
+                "Truncated train sampling (top_p/top_k) requires temperature > 0: greedy sampling has "
+                "no truncated distribution to replay, and the inference server rejects such requests "
+                "while sampling-mask capture is on."
+            )
+
+        algos = [env.algo for env in self.train.source] or [self.train.algo]
+        if any(algo.type in ("opd", "opsd") for algo in algos):
+            raise ValueError(
+                "opd/opsd is not supported with truncated train sampling: reference logprobs are full-vocab "
+                "prefill scores while trainer logprobs are renormalized over the sampling mask, biasing the "
+                "ref_kl term. Remove the truncation (top_p/top_k) or the opd/opsd algo."
+            )
+
+        if any(sampling.top_k is None for sampling in truncating):
+            warnings.warn(
+                f"Truncated train sampling: defaulting top_k = {TRAIN_TOP_K_DEFAULT} so every replayed "
+                "support is bounded. Set top_k explicitly to override.",
+                stacklevel=2,
+            )
+            self.update_policy_samplings(
+                lambda sampling: (
+                    sampling.model_copy(update={"top_k": TRAIN_TOP_K_DEFAULT})
+                    if sampling.truncates_distribution() and sampling.top_k is None
+                    else sampling
+                )
+            )
+
+        return self
+
+    @property
+    def policy_samplings(self) -> list[TrainSamplingConfig]:
+        """Sampling of each train source that samples from the policy, else the group's when
+        there are no sources."""
+        if not self.train.source:
+            return [self.train.sampling]
+        return [env.sampling for env in self.train.source if env.algo.rollout_model == "policy"]
+
+    def update_policy_samplings(self, update: Callable[[TrainSamplingConfig], TrainSamplingConfig]) -> None:
+        """Replace each of ``policy_samplings`` with ``update(sampling)``. The group's sampling is
+        a frozen field, so its config is copied rather than assigned."""
+        if not self.train.source:
+            self.train = self.train.model_copy(update={"sampling": update(self.train.sampling)})
+        for env in self.train.source:
+            if env.algo.rollout_model == "policy":
+                env.sampling = update(env.sampling)
+
+    @property
+    def any_policy_sourced(self) -> bool:
+        """True when at least one train env samples rollouts from the live policy."""
+        return any(env.algo.rollout_model == "policy" for env in self.train.source)
+
+    @model_validator(mode="after")
+    def validate_renderer_auto_resolves(self):
+        """Reject the silent DefaultRenderer fallback at config time.
+
+        When ``renderer.name='auto'`` and the model isn't in
+        ``MODEL_RENDERER_MAP``, ``create_renderer`` would fall back to
+        ``DefaultRenderer``. That fallback doesn't fix the
+        position-dependent chat-template bug the renderer client exists
+        to solve, and rejects envs that pass tools (the rollout dies
+        with "RendererPool does not support tools") unless
+        ``DefaultRendererConfig.tool_parser`` is configured. Surface at
+        config time so ``--dry-run`` reports the error.
+        """
+        if self.renderer.name != "auto":
+            return self
+        from renderers.base import MODEL_RENDERER_MAP
+
+        model_id = self.tokenizer.name or self.model.name
+        if model_id in MODEL_RENDERER_MAP:
+            return self
+        raise ValueError(
+            f"orchestrator.renderer.name='auto' but "
+            f"{model_id!r} is not in renderers.base.MODEL_RENDERER_MAP, so it "
+            f"would silently fall back to DefaultRenderer. Pick one: "
+            f"(a) [orchestrator.renderer] name='default' — for fine-tunes / "
+            f"vendored mirrors with custom chat templates (DefaultRenderer "
+            f"calls apply_chat_template); set tool_parser=<name> if the env "
+            f"uses tools. "
+            f"(b) [orchestrator.renderer] name=<model-specific renderer> — "
+            f"if {model_id!r} is template-identical to a mapped family "
+            f"(and ideally also add it upstream to "
+            f"renderers.base.MODEL_RENDERER_MAP)."
+        )
+
+    @model_validator(mode="after")
+    def resolve_batching(self):
+        group_sizes = [source.group_size for source in self.train.source] or [self.train.group_size]
+        if any(self.batch_size % size for size in group_sizes):
+            raise ValueError(
+                f"Batch size {self.batch_size} must be divisible by every train source's group_size {sorted(set(group_sizes))}"
+            )
+
+        for field in ("max_inflight", "initial_inflight"):
+            value = getattr(self.concurrency, field)
+            if value is not None and value < max(group_sizes):
+                raise ValueError(
+                    f"concurrency.{field} must be at least the largest train group_size ({max(group_sizes)})"
+                )
+
+        return self
+
+    @model_validator(mode="after")
+    def resolve_sampling_replay(self):
+        """Opt policy train sources into replay and keep eval sampling independent."""
+        for env in self.train.source:
+            # Policy-sourced rollouts hit our vLLM server; frozen-sourced
+            # rollouts may hit external OAI endpoints that reject these knobs.
+            if env.algo.rollout_model == "policy":
+                extra_args = dict(env.sampling.extra_body.get("extra_args") or {})
+                extra_args["prl_replay"] = env.sampling.truncates_distribution()
+                env.sampling.extra_body["extra_args"] = extra_args
+        if self.eval is not None:
+            for env in self.eval.source:
+                if getattr(env.sampling, "top_k", None) is None:
+                    env.sampling.top_k = -1
+                env.sampling.logprobs = None
+        return self
+
+    @property
+    def env_sources(self) -> list[tuple[str, EnvConfig]]:
+        """Every ``(split, source)`` this run pulls from, train first then eval — the
+        order used by the launcher to write per-source pool configs."""
+        sources: list[tuple[str, EnvConfig]] = [("train", source) for source in self.train.source]
+        if self.eval is not None:
+            sources += [("eval", source) for source in self.eval.source]
+        return sources
+
+    @property
+    def env_addresses(self) -> dict[tuple[str, str], str | None]:
+        """Where each source's env worker pool lives, keyed by ``(split, resolved_name)``: the
+        source's own ``serve.address`` when set (an externally managed pool), else None —
+        the launcher starts the pool, whose broker binds an OS-assigned port and publishes it
+        to the source's address file for the orchestrator to pick up."""
+        return {(split, source.resolved_name): source.serve.address for split, source in self.env_sources}

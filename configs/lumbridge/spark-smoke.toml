@@ -1,0 +1,12 @@
+# 5-step SFT on fake data with Qwen3-0.6B: proves the trainer, FSDP and flash-attention work on this box.
+# On a DGX Spark it takes about 30 s and needs a few GB of unified memory.
+max_steps = 5
+
+[model]
+name = "PrimeIntellect/Qwen3-0.6B"
+compile = "None"
+
+[data]
+type = "fake"
+batch_size = 2
+seq_len = 1024

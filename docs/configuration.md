@@ -1,0 +1,290 @@
+# Configuration
+
+Every `prime-rl` entrypoint uses [`pydantic-config`](https://github.com/PrimeIntellect-ai/pydantic-config): TOML files for reproducible base configs, CLI flags for one-off overrides.
+
+> **AI agents working in this repo:** the equivalent runbook is at [`skills/configs/SKILL.md`](https://github.com/PrimeIntellect-ai/prime-rl/blob/main/skills/configs/SKILL.md), with extra runtime hints (where config classes live, validator conventions) that aren't surfaced here.
+
+## Table of Contents
+
+- [Sources and Precedence](#sources-and-precedence)
+- [TOML Composition](#toml-composition)
+- [CLI Overrides](#cli-overrides)
+- [Inspecting and Validating](#inspecting-and-validating)
+- [Syntax](#syntax)
+  - [Booleans](#booleans)
+  - [Lists](#lists)
+  - [Dicts](#dicts)
+  - [Optional Sub-Configs](#optional-sub-configs)
+  - [None](#none)
+  - [Discriminated Unions](#discriminated-unions)
+  - [Environments](#environments)
+  - [Environment Variables](#environment-variables)
+- [Examples](#examples)
+
+## Sources and Precedence
+
+Field values come from three sources — Pydantic defaults, TOML files (passed with `@`), and CLI flags. They're layered in this order, with later sources winning:
+
+1. **Defaults** declared on the Pydantic model.
+2. **TOML files** passed with `@`, left to right — later files override earlier ones.
+3. **CLI flags** in dotted, kebab-case form (`--model.name`).
+
+## TOML Composition
+
+The `@` token introduces a TOML file. Multiple `@` arguments compose left-to-right, deep-merged — unset fields in an overlay keep the base value:
+
+```bash
+uv run rl @ examples/basic/reverse-text/rl.toml                      # one file
+uv run rl @ base.toml @ overlay.toml                           # left to right
+uv run rl --trainer @ trainer.toml --orchestrator @ orch.toml  # per-section
+uv run rl @ base.toml --trainer @ trainer.toml                 # mixed
+```
+
+> Mind the space: `@ path/to/x.toml`, not `@path/to/x.toml`.
+
+## CLI Overrides
+
+CLI flags mirror the TOML tree using dots:
+
+```bash
+--max-steps 50                              # top-level
+--model.name Qwen/Qwen3-4B                  # nested
+--trainer.optim.lr 1e-5                     # double-nested
+--inference.vllm.tensor-parallel-size 4
+```
+
+> Field names are snake_case in TOML (`max_model_len`) and kebab-case on the CLI (`--max-model-len`).
+
+> A renamed field keeps no alias for its old name: the old spelling fails as an unknown key rather than being silently translated.
+
+## Inspecting and Validating
+
+```bash
+uv run rl --help                                       # full schema
+uv run rl @ rl.toml --dry-run --output-dir /tmp --run.name check  # write resolved configs (JSON) to /tmp/check/configs
+```
+
+## Syntax
+
+### Booleans
+
+CLI uses paired flags: bare `--flag` sets `True`, `--no-flag` sets `False`. TOML must be explicit:
+
+```bash
+uv run rl @ rl.toml --clean       # True
+uv run rl @ rl.toml --no-clean    # False
+```
+
+```toml
+clean = true
+```
+
+### Lists
+
+CLI accepts space-separated values or a JSON literal. TOML uses an array literal. Both forms target the same field:
+
+```bash
+uv run rl @ rl.toml --trainer.model.lora.target-modules q_proj k_proj v_proj
+uv run rl @ rl.toml --trainer.model.lora.target-modules '["q_proj", "k_proj", "v_proj"]'
+```
+
+```toml
+[trainer.model.lora]
+target_modules = ["q_proj", "k_proj", "v_proj"]
+```
+
+Overlay TOMLs **replace** lists wholesale — an overlay that wants to add one item must still spell out the full list. For arrays of tables, see [Environments](#environments).
+
+### Dicts
+
+CLI takes a JSON literal. TOML uses a table. CLI dicts deep-merge with TOML dicts — CLI keys win on conflict but don't wipe the file's keys:
+
+```bash
+uv run rl @ rl.toml --orchestrator.train.source.0.args \
+  '{"dataset_name": "openai/gsm8k", "dataset_subset": "main"}'
+```
+
+```toml
+[[orchestrator.train.source]]
+args.dataset_name = "openai/gsm8k"
+args.dataset_subset = "main"
+```
+
+### Optional Sub-Configs
+
+Many sub-configs are typed `SomeConfig | None`. Two patterns enable them:
+
+- **Bare flag with defaults**: `--model.compile` or, in TOML, an empty section `[model.compile]`. The sub-config materializes with all-default values.
+- **Enable and set fields together**: `--model.compile.fullgraph` (CLI) or any populated `[model.compile]` table (TOML).
+
+To **disable** a sub-config that's on by default, use `--no-<name>` on the CLI or assign the string `"None"` in TOML (see [None](#none)). This is how `[ckpt]`, `[model.lora]`, `[model.compile]`, `[trainer.wandb]`, etc. are turned on and off.
+
+### None
+
+TOML has no `null`. Use the string `"None"`, which the loader coerces:
+
+```toml
+[inference.vllm]
+max_model_len = "None"
+```
+
+On the CLI: `--inference.vllm.max-model-len None`.
+
+### Discriminated Unions
+
+Loss, advantage, optimizer, scheduler, weight broadcast transport, and several others are discriminated unions. Set the `type` field to pick a variant:
+
+```toml
+[trainer.optim]
+type = "muon"
+lr = 1e-5
+mu = 0.95
+```
+
+Omit `type` to keep the default variant.
+
+### Environments
+
+Training and evaluation sources are arrays of tables. Set one source per environment; training sources can optionally carry sampling weights:
+
+```toml
+[[orchestrator.train.source]]
+name = "gsm8k"
+ratio = 3  # 75% of batches
+env.taskset.id = "gsm8k"
+env.taskset.split = "train"
+env.agent.harness.id = "null"
+env.agent.runtime.type = "subprocess"
+
+[[orchestrator.train.source]]
+name = "reverse-text"
+ratio = 1  # default — 25% of batches
+env.taskset.id = "reverse-text"
+env.agent.harness.id = "null"
+env.agent.runtime.type = "subprocess"
+
+[[orchestrator.eval.source]]
+name = "gsm8k-eval"
+env.taskset.id = "gsm8k"
+env.taskset.split = "test"
+env.agent.harness.id = "null"
+env.agent.runtime.type = "subprocess"
+```
+
+Each source group — `[orchestrator.train]`, `[orchestrator.eval]`, the `[eval]` block of `sft` and the top level of `eval` — holds defaults for its sources. Every field that a group and its sources both have is a default: `env`, `sampling`, `select` and `group_size`, plus `algo` on the train group and `interval` on the eval groups of a training run. Each source inherits the fields that its group sets. One rule applies to all of them: nested blocks merge key by key, a source's own values win, and a block whose `type` (e.g. of `algo`) differs from the group's is the source's alone.
+
+Sampling parameters use Verifiers' shared normalization: `max_tokens` and `max_completion_tokens` name the same limit, and `extra_body` parameters merge like top-level parameters. Agent overrides apply after source defaults; an explicit null clears an inherited parameter. Resolved sampling is recorded on each trace.
+
+For live-policy training, set distribution parameters (`temperature`, `top_p`, `top_k`) on the source's `sampling` block. Every agent in that source, including non-trainable roles, may override only `max_tokens`, `reasoning_effort`, and `chat_template_kwargs`. These rules are checked when loading the config; evaluation and frozen-model sources allow general agent sampling overrides.
+
+```toml
+[orchestrator.train]
+group_size = 16
+
+[orchestrator.train.algo]
+type = "grpo"
+
+[[orchestrator.train.source]]
+env.taskset.id = "math"
+group_size = 32  # this source's own value wins over the group's 16
+
+[orchestrator.eval.env]
+retries.rules = [
+  {type = "ProviderError", max_retries = 3},
+  {type = "SandboxError", max_retries = 3},
+]
+timeout.episode = 7200
+
+[orchestrator.eval.select]  # evaluate 128 tasks of each taskset
+limit = 128
+```
+
+The group `env` block holds only the knobs that every env and taskset has: `retries`, `timeout`, `max_concurrent_agents`, `interception`, and `taskset.task` and `taskset.system_prompt`. Ids and agents stay on each source. `select` picks which tasks of a source's taskset run: `include`/`exclude` by task `idx`/`ids`/`keys`/`names`, then `shuffle`, `skip` and `limit`, in that order.
+
+`ratio` is a training-source field: it defaults to `1` (equal weight per env), and values are relative weights normalized to probabilities across envs. Eval sources of a training run carry `interval` instead, the step interval at which they fire; a standalone eval has neither.
+
+Everything environment lives under the `env` block (verifiers' `[env]` shape): `env.taskset` configures the v1 taskset, and each agent is a field on the env — `env.agent.harness` selects how the single-agent env's tasks are run, and per-run caps are per-agent (`env.agent.max_turns`, `env.agent.timeout`, `env.agent.max_output_tokens`). A multi-agent env declares its own seats (`env.<role>.*`).
+
+The same taskset can appear multiple times across train and eval (or with different settings) — useful for evaluating on a held-out split or comparing two configurations side by side. When it is reused, set a distinct `name` on each entry; `name` defaults to the taskset id and must be unique across all envs in the same group.
+
+### Environment Variables
+
+OS environment variables exported into launched component process(es). In `rl` configs, top-level `[env_vars]` applies to trainer, inference, and orchestrator:
+
+```toml
+[env_vars]
+HF_HUB_OFFLINE = "1"
+TOKENIZERS_PARALLELISM = "false"
+```
+
+Component-specific tables layer on top:
+
+```toml
+[trainer.env_vars]
+NCCL_DEBUG = "INFO"
+PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:False"
+
+[inference.env_vars]
+VLLM_USE_DEEP_GEMM = "1"
+
+[orchestrator.env_vars]
+PRIME_LOG_LEVEL = "debug"
+```
+
+The `rl` launcher applies these the same way in both single-node and multi-node (SLURM) runs. Precedence, low to high:
+
+1. The launcher's own defaults — **your `env_vars` override these**.
+2. Your top-level `[env_vars]`.
+3. Your `[component.env_vars]`.
+4. Orchestration-critical vars the launcher always sets last — `CUDA_VISIBLE_DEVICES` (GPU partitioning) and `WANDB_SHARED_*` (the single shared W&B run) — **these cannot be overridden** from `env_vars`.
+
+For standalone `sft` and `inference` configs, `[env_vars]` applies to that entrypoint's process(es). For disaggregated P/D inference, the role-specific [`deployment.{prefill,decode}_env_vars`](inference.md) layer on top of any shared inference env vars.
+
+## Examples
+
+The shipped end-to-end examples in [`examples/`](https://github.com/PrimeIntellect-ai/prime-rl/tree/main/examples) are the canonical, kept-up-to-date references — the rest of the repo's TOMLs (under `configs/`) are CI- and debug-internal and may drift. Each basic example directory has its own README with the full launch story; the advanced examples are config-only.
+
+**Basic** (1–8 GPUs):
+
+- [**Reverse Text**](https://github.com/PrimeIntellect-ai/prime-rl/tree/main/examples/basic/reverse-text) — `Qwen3-0.6B` reversing a chunk of text. Tiny single-turn SFT + RL; runs on a single consumer GPU in minutes.
+- [**Wordle**](https://github.com/PrimeIntellect-ai/prime-rl/tree/main/examples/basic/wordle) — `Qwen3-1.7B` playing Wordle. Multi-turn SFT + RL; 2–4 H100s.
+- [**Alphabet Sort**](https://github.com/PrimeIntellect-ai/prime-rl/tree/main/examples/basic/alphabet-sort) — `Qwen3-4B-Instruct-2507` sorting names alphabetically. Multi-turn LoRA RL without SFT warmup; one H100.
+- [**Wiki Search**](https://github.com/PrimeIntellect-ai/prime-rl/tree/main/examples/basic/wiki-search) — `Qwen3-4B-Instruct-2507` answering trivia by searching a Wikipedia corpus. Multi-turn with tool use.
+- [**Hendrycks Sanity**](https://github.com/PrimeIntellect-ai/prime-rl/tree/main/examples/basic/hendrycks-sanity) — `Qwen3-1.7B` on a filtered MATH subset. Useful for algorithm ablations.
+
+**Advanced** (32–2048 GPUs, SLURM):
+
+- [**Qwen3-30B-A3B**](https://github.com/PrimeIntellect-ai/prime-rl/tree/main/examples/advanced/qwen3-30b-a3b) — `Qwen3-30B-A3B` on math, SWE, and tool use.
+- [**GLM-4.5-Air**](https://github.com/PrimeIntellect-ai/prime-rl/tree/main/examples/advanced/glm-4.5-air) — `GLM-4.5-Air` on search, SWE, and terminal; includes a variant that trains the 100B+ MoE on only two nodes.
+- [**Nemotron-3-Super**](https://github.com/PrimeIntellect-ai/prime-rl/tree/main/configs/advanced/nemotron-3-super) — `Nemotron-3-Super-120B` hybrid-Mamba MoE on SWE at 131k context.
+- [**MiniMax-M2.5 SWE**](https://github.com/PrimeIntellect-ai/prime-rl/tree/main/configs/advanced/minimax-m2.5) — `MiniMax-M2.5` on agentic SWE.
+- [**INTELLECT-3.1**](https://github.com/PrimeIntellect-ai/prime-rl/tree/main/examples/advanced/intellect-3.1) — reproduces our INTELLECT-3.1 training run.
+- [**High-throughput GLM-5**](https://github.com/PrimeIntellect-ai/prime-rl/tree/main/examples/advanced/glm-5.3) — large-scale `GLM-5`/`GLM-5.3` inference with P/D disaggregation and FP8.
+
+### Worked Example: Compose, Override, Dry-Run
+
+Start from a shipped base config, override two fields on the CLI, and dry-run:
+
+```bash
+uv run rl @ examples/basic/reverse-text/rl.toml \
+  --monitors.wandb.name my-experiment \
+  --trainer.optim.lr 5e-6 \
+  --output-dir /tmp/reverse-dry \
+  --run.name check \
+  --dry-run
+```
+
+Then inspect the resolved config:
+
+```bash
+ls /tmp/reverse-dry/check/configs/latest/resolved/
+# rl.json  trainer.json  orchestrator.json  inference.json
+```
+
+Each per-process JSON contains the final, validated configuration that the run
+uses. This is also what each standalone process reads. For example, the trainer
+reads `configs/latest/resolved/trainer.json`.
+
+`configs/latest/command.txt` records the shell-safe launch command and its CLI
+overrides. Each launch also remains under `configs/attempt_<n>/`. To compare
+configs, dry-run a known-good base and your overlay. Then diff the two attempts.

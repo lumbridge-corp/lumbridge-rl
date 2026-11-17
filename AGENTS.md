@@ -1,0 +1,66 @@
+# AGENTS.md
+
+## Writing code
+
+- **Minimal try/except**: let errors propagate — silent failures hide bugs. Only catch exceptions for intentional fault tolerance (retries, robustness).
+- **Don't touch `optimization_dtype` / `reduce_dtype`**: never change these model config fields (or their defaults in `trainer.py`) unless the user explicitly asks. They're load-bearing numerical knobs — flipping bfloat16/float32 silently changes training dynamics.
+- **Targeted comments**: don't explain your work process or reference old code. Use targeted comments sparingly to clarify ambiguous logic.
+- **Context parallelism**: a module that needs CP state holds a `CPContext` (`models/base.py`) as `self.cp_context`, defaulting to `CPContext()`, which is the non-CP case; `PreTrainedModelPrimeRL` supplies that default. `setup_context_parallel` in `utils/cp.py` builds one `CPContext` and assigns it to every module that has the field, so each module holds the same frozen object.
+- **Zen of Python**: remember the Zen of Python when writing code.
+```
+Beautiful is better than ugly.
+Explicit is better than implicit.
+Simple is better than complex.
+Complex is better than complicated.
+Flat is better than nested.
+Sparse is better than dense.
+Readability counts.
+Special cases aren't special enough to break the rules.
+Although practicality beats purity.
+Errors should never pass silently.
+Unless explicitly silenced.
+In the face of ambiguity, refuse the temptation to guess.
+There should be one-- and preferably only one --obvious way to do it.
+Although that way may not be obvious at first unless you're Dutch.
+Now is better than never.
+Although never is often better than *right* now.
+If the implementation is hard to explain, it's a bad idea.
+If the implementation is easy to explain, it may be a good idea.
+Namespaces are one honking great idea -- let's do more of those!
+```
+
+## Running code
+
+- **Always use uv**: run code with `uv run` or `uv run <command>`, never raw `python`.
+- **Tools vs entrypoints**: standalone scripts in `tools/` use plain argparse with positional args; `[project.scripts]` entrypoints use pydantic-config (`@ file.toml` + dotted CLI overrides).
+- **Adding dependencies**: add to `pyproject.toml` and run `uv sync --all-extras` to install and lock them.
+- **Git dependency pins**: when pinning git dependencies in `pyproject.toml`, always use a small (7-char) commit hash for the `rev` field.
+- **Never edit `.venv/`**: the local virtual env is read-only. Edits there are silently overwritten by the next `uv sync` and don't propagate to teammates or CI. Reading files under `.venv/` to understand library behavior is fine; writing is not. To fix a dependency issue, update `pyproject.toml` (pin a fork via 7-char commit hash if needed), vendor the code into `src/`, or patch upstream.
+
+## Docs
+
+- **Docs reflect `main`, not history**: `docs/` describes the current state of the codebase only. Don't mention removed/legacy fields, migration paths, or "this used to be X" anecdotes.
+
+## Skills
+
+Skills live in `skills/` and are symlinked to `.claude/skills/` (Claude Code) and `.agents/skills/` (Codex). They teach agents how to handle specific workflows (e.g. starting the inference server, writing configs).
+
+If a repository skill could benefit from an update, suggest the specific change, explain why it would help, and ask the user for approval before making it. Wait for approval before creating, modifying, renaming, or deleting skills, including their supporting files and symlinks. If the user has already explicitly requested or approved the skill change, proceed without asking again. Requests to change code, fix workflows, update documentation, or open a PR do not implicitly authorize skill changes. You may read and follow skills without changing them.
+
+## Testing
+
+Write tests as plain functions with pytest fixtures. Don't use class-based tests.
+
+- **Conservative test additions**: don't add new tests unless the user explicitly asks for them or it's clearly necessary. Editing existing tests is fine, but adding new test files or test functions should be the exception, not the default.
+- **Test what matters**: only test code with clear, isolated logic — pure functions, abstract base classes, data transformations, well-defined algorithms. Don't test runtime-level code, framework glue, or anything that requires extensive mocking/patching just to get a test to pass. If you need to patch everything out to make it testable, it's probably not worth testing.
+
+## Git
+
+- **Branch prefixes**: use `feat/`, `fix/`, `chore/`; use `exp/` for experiment branches (configs, run summaries, pins, notes).
+
+## GitHub
+
+- **Draft PRs**: always create PRs as drafts (`gh pr create --draft`) to avoid triggering CI unnecessarily.
+- **GPU CI is opt-in**: pushes to a PR don't run GPU tests. The full GPU suite runs on the PR's current commit when someone applies the `gpu-ci` label. Only when the user asks, request a run with `gh pr edit <num> --add-label gpu-ci`. The workflow removes the label, so re-add it after new pushes.
+- **Pull requests**: do not include a "test plan" section in PR descriptions unless you actually ran tests to verify the changes or the user explicitly asked for one.
+- **Keep PR descriptions in sync**: every time you push commits to a PR, also update the PR description (`gh pr edit <num> --body-file ...`) so it reflects the current state of the branch — not just what was true when the PR was opened. Preserve any auto-generated blocks (e.g. `<!-- CURSOR_SUMMARY -->`).

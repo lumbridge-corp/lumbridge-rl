@@ -1,0 +1,350 @@
+import os
+import re
+from pathlib import Path
+from typing import Annotated, Literal, TypeAlias
+
+from pydantic import AfterValidator, Field, model_validator
+from verifiers.v1.configs.client import BaseClientConfig
+
+from prime_rl.utils.config import BaseConfig
+
+# Launcher-managed env vars that a component's `env_vars` must not set: GPU partitioning
+# and the single shared W&B run. The launcher always sets these last, so allowing them in
+# `env_vars` would be a silent no-op (or, on multi-node, a footgun) — reject them instead.
+PROTECTED_ENV_VARS = frozenset(
+    {
+        "CUDA_VISIBLE_DEVICES",
+        "PRL_RUN_ID",
+        "PRL_RUN_NAME",
+        "WANDB_RUN_ID",
+        "WANDB_SHARED_MODE",
+        "WANDB_SHARED_LABEL",
+        "WANDB_SHARED_PRIMARY",
+        "WANDB_SHARED_FINISHER",
+    }
+)
+
+
+def reject_protected_env_vars(env_vars: dict[str, str]) -> dict[str, str]:
+    clobbered = sorted(PROTECTED_ENV_VARS & env_vars.keys())
+    if clobbered:
+        raise ValueError(
+            f"env_vars cannot set launcher-managed vars {clobbered} — set by the launcher, not overridable"
+        )
+    return env_vars
+
+
+EnvVars: TypeAlias = Annotated[dict[str, str], AfterValidator(reject_protected_env_vars)]
+"""A per-component `env_vars` mapping, validated to not clobber `PROTECTED_ENV_VARS`."""
+
+
+class BaseWeightBroadcastConfig(BaseConfig):
+    timeout: int = 3600
+    """Timeout in seconds for the broadcast handshake and transfer, including the orchestrator's wait
+    for the trainer's startup broadcast. The trainer fails the run when no consumer acknowledges an
+    offered version in time. Raise it for large models on slow shared filesystems."""
+
+
+class FileSystemWeightBroadcastConfig(BaseWeightBroadcastConfig):
+    type: Literal["filesystem"] = "filesystem"
+
+
+class InMemoryWeightBroadcastConfig(BaseWeightBroadcastConfig):
+    host: str = "localhost"
+    """Weight transfer host."""
+
+    port: int
+    """Weight transfer port."""
+
+    inference_world_size: int = Field(1, ge=1)
+    """Total inference workers across all servers. Set automatically by ``rl`` and ``sft``."""
+
+
+class NCCLWeightBroadcastConfig(InMemoryWeightBroadcastConfig):
+    type: Literal["nccl"] = "nccl"
+
+    port: int = 29501
+    """Port for the NCCL broadcast rendezvous."""
+
+
+class NIXLWeightBroadcastConfig(InMemoryWeightBroadcastConfig):
+    type: Literal["nixl"] = "nixl"
+
+    port: int = 8001
+    """ModelExpress gRPC port."""
+
+    session_id: str = "default"
+    """ModelExpress session ID."""
+
+    overlap_transfer_and_replay: bool = False
+    """Allocate two transfer arenas so inference can replay one weight group while receiving the next."""
+
+
+class ModelExpressWeightBroadcastConfig(InMemoryWeightBroadcastConfig):
+    type: Literal["modelexpress"] = "modelexpress"
+
+    port: int = 8001
+    """ModelExpress gRPC port."""
+
+    metadata_port: int = 5655
+    """Base port of the trainer's NIXL metadata listener. Each local rank listens on this plus its device id."""
+
+    staging_mode: Literal["COPY_TO_HOST", "COPY_TO_DEVICE", "IN_PLACE"] = "COPY_TO_HOST"
+    """Trainer storage policy passed to ModelExpress."""
+
+    staging_buffer_bytes: int | None = Field(None, gt=0)
+    """Receiver staging capacity per buffer. None stages a complete update."""
+
+    staging_buffers_count: int = Field(1, ge=1)
+    """Number of receiver buffers. Two overlap the next read with installation."""
+
+
+WeightBroadcastConfig: TypeAlias = Annotated[
+    FileSystemWeightBroadcastConfig
+    | NCCLWeightBroadcastConfig
+    | NIXLWeightBroadcastConfig
+    | ModelExpressWeightBroadcastConfig,
+    Field(discriminator="type"),
+]
+"""Weight transfer from trainer to inference. ``rl`` copies its ``[weight_broadcast]`` to the trainer and orchestrator."""
+
+
+class BaseDeploymentConfig(BaseConfig):
+    gpus_per_node: int = 8
+    """GPUs per node."""
+
+
+class BaseSingleNodeDeploymentConfig(BaseDeploymentConfig):
+    type: Literal["single_node"] = "single_node"
+
+    num_train_gpus: int = 1
+    """GPUs allocated to the trainer."""
+
+    num_infer_gpus: int = 1
+    """GPUs allocated to inference. ``sft`` uses them only for online evals with an ``[inference]`` block."""
+
+
+class BaseMultiNodeDeploymentConfig(BaseDeploymentConfig):
+    type: Literal["multi_node"] = "multi_node"
+
+    num_train_nodes: int = Field(ge=1)
+    """Training nodes."""
+
+
+class RunConfig(BaseConfig):
+    name: str | None = None
+    """Run name. Auto-generated as ``<envs>--<model>--<short-id>`` when unset, so every launch gets a fresh, readable run directory; set an explicit name (e.g. an experiment name) to get a predictable run directory, which is also required to resume a previous run. Unless set explicitly, the W&B run name and the Prime platform run name inherit it."""
+
+    dir: str | None = None
+    """Run directory name — the run writes all its artifacts to ``output_dir / dir``. Defaults to ``run.name``; set it only when the directory should differ from the display name."""
+
+
+class ControlConfig(BaseConfig):
+    host: str = "0.0.0.0"
+    """Address the control API binds to."""
+
+    port: int = Field(8040, ge=1, le=65535)
+    """Port the control API listens on."""
+
+
+class ResumeConfig(BaseConfig):
+    """Resume the run from a checkpoint. A bare ``--resume`` (or empty ``[resume]`` block)
+    resumes from the latest checkpoint."""
+
+    step: int | None = Field(None, ge=1)
+    """Checkpoint step to resume from. None resumes from the latest checkpoint."""
+
+    dir: Path | None = None
+    """External checkpoint step directory to resume from (e.g. ``other/run/checkpoints/step_50``) — forks another run's checkpoint into this run. Mutually exclusive with ``step``."""
+
+    @model_validator(mode="after")
+    def validate_step_xor_dir(self):
+        if self.step is not None and self.dir is not None:
+            raise ValueError(
+                "resume.step and resume.dir are mutually exclusive — the step is taken from the directory name"
+            )
+        if self.dir is not None:
+            validate_step_dir(self.dir, field="resume.dir")
+        return self
+
+    @property
+    def dir_step(self) -> int:
+        """The step encoded in ``dir``'s name (validated to exist)."""
+        assert self.dir is not None
+        return int(self.dir.name.removeprefix("step_"))
+
+
+class SlurmConfig(BaseConfig):
+    job_name: str | None = None
+    """SLURM job name. Defaults to ``run.name`` for ``rl`` and ``sft``, and to ``inference`` for ``inference``."""
+
+    project_dir: Path = Path(".")
+    """Path to the project root, used to source .env, activate .venv, and run uv sync."""
+
+    template_path: Path | None = None
+    """SLURM template file. If None, uses the bundled single-node or multi-node template."""
+
+    partition: str | None = None
+    """SLURM partition (#SBATCH --partition). If None, the job goes to the cluster's default partition."""
+
+    nodelist: str | None = None
+    """Comma-separated list of specific nodes to run on (#SBATCH --nodelist)."""
+
+    exclude: str | None = None
+    """Comma-separated list of nodes to exclude (#SBATCH --exclude)."""
+
+    account: str | None = None
+    """SLURM account to charge (#SBATCH --account)."""
+
+    time: str | None = None
+    """Maximum wall time, e.g. '24:00:00' or '7-00:00:00' (#SBATCH --time)."""
+
+    pre_run_command: str | None = None
+    """Shell command to run on the head node after cd, .env sourcing, and venv activation. Useful for cleanup like ``sudo pkill -f vllm``; wrap with ``srun bash -c '...'`` to fan out to all nodes."""
+
+    launch_modelexpress: bool = True
+    """Start a job-scoped ModelExpress server for NIXL and ModelExpress weight broadcasts on multi-node jobs."""
+
+    cleanup_grace_period: int = Field(3600, ge=0)
+    """Maximum seconds a multi-node RL job that hit a non-zero exit waits for an in-flight trainer checkpoint to finish before tearing down. Without an in-flight checkpoint (or without ``[ckpt]``) it tears down immediately. Set to 0 to never wait."""
+
+    shared_fs: bool = True
+    """Whether the project filesystem (including the venv) is shared across nodes (e.g. NFS). When True, a single ``uv sync`` on the batch node suffices. Set to False when the venv is node-local (e.g. ``UV_PROJECT_ENVIRONMENT`` on ``/tmp``) so ``uv sync`` runs on every node via srun."""
+
+    @property
+    def template_vars(self) -> dict:
+        """Common template variables for all SLURM templates."""
+        return {
+            "job_name": self.job_name,
+            "project_dir": self.project_dir,
+            "partition": self.partition,
+            "nodelist": self.nodelist,
+            "exclude": self.exclude,
+            "account": self.account,
+            "time": self.time,
+            "pre_run_command": self.pre_run_command,
+            "cleanup_grace_period": self.cleanup_grace_period,
+            "shared_fs": self.shared_fs,
+        }
+
+    @model_validator(mode="after")
+    def resolve_project_dir(self):
+        self.project_dir = self.project_dir.resolve()
+        return self
+
+
+ServerType = Literal["vllm", "openai"]
+
+
+class VLMConfig(BaseConfig):
+    freeze_vision_encoder: bool = True
+    """Freeze the vision encoder parameters during training."""
+
+
+class BaseModelConfig(BaseConfig):
+    name: str = "Qwen/Qwen3-0.6B"
+    """HF model name or local path."""
+
+    trust_remote_code: bool = False
+    """Trust remote code when initializing the tokenizer."""
+
+
+class DynamoConfig(BaseConfig):
+    enabled: bool = True
+    """Enable Dynamo worker discovery for the inference admin plane."""
+
+    discovery_url: str | None = Field(default=None, min_length=1, max_length=2048)
+    """Dynamo frontend URL used to discover inference workers for RL control."""
+
+
+class ClientConfig(BaseClientConfig):
+    wait_for_ready_timeout: int = 3600
+    """Seconds to wait at startup for the inference pool to become ready."""
+
+    skip_model_check: bool = False
+    """Skip checking that the model is available in the inference pool. Useful for external APIs or keys that do not expose ``/models``."""
+
+    admin_base_url: list[str] | None = None
+    """Separate base URLs for admin operations (weight updates, health checks). When set, admin clients bypass routers and hit each server directly — used in multi-replica or disaggregated P/D deployments where the router must not handle admin traffic."""
+
+
+class VLLMClientConfig(ClientConfig):
+    """Client defaults for the live inference deployment managed by training."""
+
+    base_url: str = "http://localhost:8000/v1"
+    api_key_var: str = "VLLM_API_KEY"
+
+
+class PolicyClientConfig(VLLMClientConfig):
+    """Client of the policy deployment the orchestrator drives (weight updates, admin plane)."""
+
+    dynamo: DynamoConfig | None = None
+    """Dynamo RL worker-discovery configuration."""
+
+
+class LogConfig(BaseConfig):
+    level: str = Field(default_factory=lambda: os.environ.get("PRIME_LOG_LEVEL", "info"))
+    """Log level for the process and the verifiers library it runs, env worker pools included.
+    Defaults to ``$PRIME_LOG_LEVEL`` if set, else ``info``."""
+
+    json_logging: bool = False
+    """Emit newline-delimited JSON logs for aggregation (Loki, Grafana, etc.)."""
+
+    log_data: bool = False
+    """Log the first data sample at startup."""
+
+    interval: float = Field(10.0, gt=0)
+    """Interval (seconds) for periodic logs across components."""
+
+
+class TrainerLogConfig(LogConfig):
+    ranks_filter: list[int] = [0]
+    """Trainer ranks to show in console output. Passed to ``torchrun --local-ranks-filter``."""
+
+
+class GCConfig(BaseConfig):
+    interval: int = Field(50, ge=1)
+    """Run a scheduled garbage collection every N training steps, in place of Python's automatic collections that would run at unpredictable times."""
+
+
+class HeartbeatConfig(BaseConfig):
+    url: str
+    """URL to send the heartbeat to."""
+
+    min_interval: float = Field(30.0, gt=0)
+    """Minimum seconds between pings. Beats can arrive far more often (evals beat once
+    per landed episode); surplus beats are dropped to stay under Better Stack's heartbeat
+    rate limit. Size it well under the monitor's period."""
+
+
+class BaseTransportConfig(BaseConfig):
+    retain: bool = False
+    """Keep every shipped step, and the training arrays the env worker pools hold for it,
+    until a trainer checkpoint covers it, so a restarted trainer resumes from its newest
+    checkpoint and trains the steps since again. Needs a checkpoint interval, the filesystem
+    weight broadcast, a run directory the orchestrator and trainer share, and a rollout store
+    in every train env worker pool: the ``rl`` launcher sets ``store_dir`` for the pools it
+    starts, a pool started separately needs it in its own config."""
+
+
+class FileSystemTransportConfig(BaseTransportConfig):
+    type: Literal["filesystem"] = "filesystem"
+
+
+class ZMQTransportConfig(BaseTransportConfig):
+    type: Literal["zmq"] = "zmq"
+
+    host: str = "localhost"
+    """Host address for ZMQ transport."""
+
+    port: int = 5555
+    """Port for ZMQ transport."""
+
+
+TransportConfig: TypeAlias = Annotated[FileSystemTransportConfig | ZMQTransportConfig, Field(discriminator="type")]
+
+
+def validate_step_dir(path: Path, *, field: str) -> None:
+    """Raise unless ``path`` names a checkpoint step directory (``.../step_<N>``)."""
+    if not re.fullmatch(r"step_\d+", path.name):
+        raise ValueError(f"{field} must point at a checkpoint step directory (`.../step_<N>`), got '{path}'")

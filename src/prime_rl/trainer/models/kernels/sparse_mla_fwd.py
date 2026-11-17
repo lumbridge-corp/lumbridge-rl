@@ -1,0 +1,321 @@
+# Vendored from tile-ai/tilelang (Apache 2.0), modified for dynamic shapes.
+
+# TileLang ships a libcudart stub that proxies to the real CUDA runtime via
+# dlsym(RTLD_DEFAULT, ...).  If the stub's own symbols are the first ones found
+# (because nothing loaded the real libcudart globally yet), the self-check fails
+# and the stub calls abort().  Pre-loading the real library with RTLD_GLOBAL
+# ensures dlsym finds it before the stub's own exports.
+import ctypes as _ctypes
+
+try:
+    _ctypes.CDLL("libcudart.so", mode=_ctypes.RTLD_GLOBAL)
+except Exception:
+    # This is expected on CPU-only machines
+    pass
+
+import math
+
+import tilelang
+import torch
+from tilelang import language as T
+
+from prime_rl.configs.trainer import DSABackend
+from prime_rl.trainer.models.kernels.sparse_mla_bwd import (
+    flat_kv_indices,
+    sparse_mla_backward,
+)
+
+
+@tilelang.jit(
+    out_idx=[-2, -1],
+    pass_configs={
+        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+    },
+)
+def sparse_mla_fwd(
+    heads,
+    dim,
+    tail_dim,
+    topk,
+    kv_group=1,
+    sm_scale=None,
+    is_causal=True,
+    CP0=True,
+    block_I=64,
+    num_stages=2,
+    threads=256,
+):
+    assert dim == tilelang.math.next_power_of_2(dim), f"haven't check padding correctness yet, dim={dim}"
+    assert tail_dim == 0 or tail_dim == tilelang.math.next_power_of_2(tail_dim), (
+        f"haven't check padding correctness yet, dim={tail_dim}"
+    )
+    assert is_causal is True, "non-casual is not supported"
+    assert topk % block_I == 0, "otherwise will load some index=0 thus causing wrong kv to be loaded"
+    if sm_scale is None:
+        sm_scale = (1.0 / (dim + tail_dim)) ** 0.5 * 1.44269504  # log2(e)
+    else:
+        sm_scale = sm_scale * 1.44269504  # log2(e)
+
+    batch = T.dynamic("batch")
+    seq_len = T.dynamic("seq_len")
+    seq_len_kv = T.dynamic("seq_len_kv")
+
+    head_kv = heads // kv_group
+    q_shape = [batch, seq_len, heads, dim + tail_dim]
+    kv_shape = [batch, seq_len_kv, kv_group, dim + tail_dim]
+    o_shape = [batch, seq_len, heads, dim]
+    indices_shape = [batch, seq_len, kv_group, topk]
+    lse_shape = [batch, seq_len, heads]
+    indices_dtype = T.int32
+    dtype = T.bfloat16
+    accum_dtype = T.float32
+
+    H = head_kv
+    padded_H = max(tilelang.math.next_power_of_2(head_kv), 16)
+    if padded_H != H:
+        assert kv_group == 1, (
+            "here we solve the H padding automatically, other wise you should handle Q copy and Output copy"
+            " with your mask (when kv_group == 1, use g_i * padded_H:(g_i+1) * padded_H would be handled"
+            " automatically)"
+        )
+    BI = block_I
+    NI = tilelang.cdiv(topk, block_I)
+    D = dim
+    D_tail = tail_dim
+
+    if head_kv > 64:
+        assert head_kv % 64 == 0, "head_kv should be a multiple of 64"
+        REPLICATE_H = head_kv // 64
+    else:
+        REPLICATE_H = 1
+
+    H_per_block = padded_H if REPLICATE_H == 1 else 64
+    has_tail = tail_dim > 0
+
+    @T.prim_func
+    def main(
+        Q: T.Tensor(q_shape, dtype),  # type: ignore
+        KV: T.Tensor(kv_shape, dtype),  # type: ignore
+        Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
+        Output: T.Tensor(o_shape, dtype),  # type: ignore
+        Lse: T.Tensor(lse_shape, accum_dtype),  # type: ignore
+    ):
+        with T.Kernel(seq_len * REPLICATE_H, batch, kv_group, threads=threads) as (
+            bx,
+            by,
+            bz,
+        ):
+            Q_shared = T.alloc_shared([H_per_block, D], dtype)
+            KV_shared = T.alloc_shared([BI, D], dtype)
+            O_shared = T.alloc_shared([H_per_block, D], dtype)  # noqa: F841
+            Lse_shared = T.alloc_shared([H_per_block], accum_dtype)  # noqa: F841
+            mask = T.alloc_fragment([BI], "bool")
+            if has_tail:
+                Q_tail_shared = T.alloc_shared([H_per_block, D_tail], dtype)
+                K_tail_shared = T.alloc_shared([BI, D_tail], dtype)
+
+            acc_o = T.alloc_fragment([H_per_block, D], accum_dtype)
+            acc_s = T.alloc_fragment([H_per_block, BI], accum_dtype)
+            S_shared = T.alloc_shared([H_per_block, BI], dtype)
+            sumexp = T.alloc_fragment([H_per_block], accum_dtype)
+            sumexp_i = T.alloc_fragment([H_per_block], accum_dtype)
+            alpha = T.alloc_fragment([H_per_block], accum_dtype)
+            m_i = T.alloc_fragment([H_per_block], accum_dtype)
+            m_i_prev = T.alloc_fragment([H_per_block], accum_dtype)
+
+            T.fill(acc_o, 0)
+            T.fill(sumexp, 0)
+            T.fill(m_i, -(2**30))
+
+            b_i, g_i = by, bz
+            s_i = bx if REPLICATE_H == 1 else (bx // REPLICATE_H)
+            # The indexer pre-filters indices using per-token `ke` and replaces out-of-range
+            # entries with the sentinel value `seq_len_kv - 1` (the last KV slot is a
+            # zero sentinel; valid K indices live in [0, seq_len_kv - 1)). This single
+            # bound preserves causality + varlen masking for both full and CP-sharded Q
+            # (where local q_i no longer matches the global K position).
+            max_kv_i = seq_len_kv - 2
+
+            H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * 64)
+            H1 = H0 + H_per_block
+
+            T.copy(Q[b_i, s_i, H0:H1, :D], Q_shared)
+            if has_tail:
+                T.copy(Q[b_i, s_i, H0:H1, D:], Q_tail_shared)
+
+            for i_i in T.Pipelined(NI, num_stages=num_stages):
+                for bi_i in T.Parallel(BI):
+                    mask[bi_i] = Indices[b_i, s_i, g_i, i_i * BI + bi_i] <= max_kv_i
+
+                for bi_i, d_i in T.Parallel(BI, D):
+                    KV_shared[bi_i, d_i] = KV[b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, d_i]
+                if has_tail:
+                    for bi_i, d_i in T.Parallel(BI, D_tail):
+                        K_tail_shared[bi_i, d_i] = KV[b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, D + d_i]
+
+                for h_i, bi_i in T.Parallel(H_per_block, BI):
+                    acc_s[h_i, bi_i] = T.if_then_else(mask[bi_i], 0, -T.infinity(acc_s.dtype))
+                T.gemm(
+                    Q_shared,
+                    KV_shared,
+                    acc_s,
+                    transpose_B=True,
+                    policy=T.GemmWarpPolicy.FullRow,
+                )
+                if has_tail:
+                    T.gemm(
+                        Q_tail_shared,
+                        K_tail_shared,
+                        acc_s,
+                        transpose_B=True,
+                        policy=T.GemmWarpPolicy.FullRow,
+                    )
+                T.copy(m_i, m_i_prev)
+                T.reduce_max(acc_s, m_i, dim=1, clear=False)
+                for h_i in T.Parallel(H_per_block):
+                    m_i[h_i] = T.max(m_i[h_i], m_i_prev[h_i])
+                for h_i in T.Parallel(H_per_block):
+                    alpha[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
+                for h_i, bi_i in T.Parallel(H_per_block, BI):
+                    acc_s[h_i, bi_i] = T.exp2(acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale)
+                T.reduce_sum(acc_s, sumexp_i, dim=1)
+                for h_i in T.Parallel(H_per_block):
+                    sumexp[h_i] = sumexp[h_i] * alpha[h_i] + sumexp_i[h_i]
+                for h_i, d_i in T.Parallel(H_per_block, D):
+                    acc_o[h_i, d_i] = acc_o[h_i, d_i] * alpha[h_i]
+
+                T.copy(acc_s, S_shared)
+                T.gemm(S_shared, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
+
+            for h_i, d_i in T.Parallel(H_per_block, D):
+                acc_o[h_i, d_i] /= sumexp[h_i]
+            for h_i in T.Parallel(H_per_block):
+                sumexp[h_i] = T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale
+
+            T.copy(acc_o, Output[b_i, s_i, H0:H1, :])
+            T.copy(sumexp, Lse[b_i, s_i, H0:H1])
+
+    return main
+
+
+def flashmla_sparse_mla_forward(
+    q: torch.Tensor, kv: torch.Tensor, indices: torch.Tensor, sm_scale: float, d_v: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """FlashMLA sparse prefill forward; returns a natural-log LSE."""
+    from prime_rl.trainer.models.kernels import flash_mla_sparse_fwd
+
+    B, S, H, D_qk = q.shape
+    S_kv, kv_group = kv.shape[1:3]
+    topk = indices.shape[-1]
+    # Shortest prefix holding every valid index, so the kernel skips the sentinel tail
+    # (the indexer sorts valid indices first); invalid entries inside it are -1.
+    positions = torch.arange(1, topk + 1, device=indices.device, dtype=torch.int32)
+    topk_length = torch.where(indices <= S_kv - 2, positions, 0).amax(-1).view(B * S)
+    out, _max_logits, lse = flash_mla_sparse_fwd(
+        q.view(B * S, H, D_qk),
+        kv.view(B * S_kv, kv_group, D_qk),
+        flat_kv_indices(indices, S_kv).view(B * S, kv_group, topk),
+        sm_scale,
+        d_v,
+        topk_length=topk_length,
+    )
+    return out.view(B, S, H, d_v), lse.view(B, S, H)
+
+
+@torch.library.custom_op(
+    "prime_rl::sparse_mla",
+    mutates_args=(),
+    schema="(Tensor q, Tensor kv, Tensor indices, str backend, float? sm_scale=None, SymInt d_v=512, SymInt block_I=64, SymInt num_stages=2, SymInt threads=256) -> (Tensor, Tensor)",
+)
+def sparse_mla(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    backend: DSABackend,
+    sm_scale: float | None = None,
+    d_v: int = 512,
+    block_I: int = 64,
+    num_stages: int = 2,
+    threads: int = 256,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sparse MLA attention over the top-k `indices`; returns the output and its natural-log LSE.
+
+    `backend` picks the kernels for the forward and (via autograd) the backward:
+    ``tilelang`` is TileLang for both; ``cudnn_flashmla`` is FlashMLA forward + cuDNN backward.
+    """
+    assert q.is_contiguous() and kv.is_contiguous() and indices.is_contiguous()
+    batch, seq_len, heads, dim_plus_tail_dim = q.shape
+    _, seq_len_kv, kv_group, _ = kv.shape
+
+    dim = d_v
+    assert 0 < dim <= dim_plus_tail_dim
+    assert kv.shape[-1] == dim_plus_tail_dim
+    assert kv.shape[0] == batch
+    tail_dim = dim_plus_tail_dim - dim
+    _, _, _, topk = indices.shape
+    assert indices.shape == (batch, seq_len, kv_group, topk)
+
+    if backend == "cudnn_flashmla":
+        if sm_scale is None:
+            sm_scale = dim_plus_tail_dim**-0.5
+        out, lse = flashmla_sparse_mla_forward(q, kv, indices, sm_scale, d_v)
+    else:
+        kernel = sparse_mla_fwd(
+            heads,
+            dim,
+            tail_dim,
+            topk,
+            kv_group,
+            sm_scale,
+            True,
+            block_I=block_I,
+            num_stages=num_stages,
+            threads=threads,
+        )
+        out, lse = kernel(q, kv, indices)
+        # The TileLang kernel returns a base-2 LSE.
+        lse = lse * math.log(2.0)
+    return out, lse
+
+
+@sparse_mla.register_fake
+def _sparse_mla_fake(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    backend: DSABackend,
+    sm_scale: float | None = None,
+    d_v: int = 512,
+    block_I: int = 64,
+    num_stages: int = 2,
+    threads: int = 256,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return q.new_empty((*q.shape[:-1], d_v)), q.new_empty(q.shape[:-1], dtype=torch.float32)
+
+
+def _sparse_mla_setup_context(ctx, inputs, output) -> None:
+    q, kv, indices, backend, sm_scale, _d_v, _block_I, _num_stages, _threads = inputs
+    out, lse = output
+    ctx.save_for_backward(q, kv, out, indices, lse)
+    ctx.sm_scale = sm_scale
+    ctx.backend = backend
+    ctx.mark_non_differentiable(lse)
+
+
+def _sparse_mla_autograd_backward(ctx, grad_out: torch.Tensor, _grad_lse: torch.Tensor | None):
+    q, kv, out, indices, lse = ctx.saved_tensors
+    dq, dkv = sparse_mla_backward(
+        q.detach(),
+        kv.detach(),
+        out.detach(),
+        grad_out,
+        indices,
+        lse.detach(),
+        ctx.backend,
+        ctx.sm_scale,
+    )
+    return dq, dkv, None, None, None, None, None, None, None
+
+
+sparse_mla.register_autograd(_sparse_mla_autograd_backward, setup_context=_sparse_mla_setup_context)
