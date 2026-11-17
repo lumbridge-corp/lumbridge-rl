@@ -1,13 +1,15 @@
 # 5-step LoRA SFT on fake data with Nemotron 3.5 Bolt-E4B (Gemma 4 layout, lumbridge adapter).
 # Proves the adapter loads through DCP, shards with FSDP and trains next to the resident Bolt on a DGX Spark.
+# Memory is trimmed for a shared box: activation checkpointing on (the default) and a small LM-head chunk, so the
+# 262k-vocab logits never materialize for the whole row. Run with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True.
 max_steps = 5
 
 [model]
 name = "nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-BF16"
 compile = "None"
-ac = "None"
 optimization_dtype = "bfloat16"
 reduce_dtype = "bfloat16"
+fused_lm_head_token_chunk_size = 512
 
 [model.lora]
 rank = 16
