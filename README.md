@@ -1,4 +1,8 @@
+![Lumbridge RL: SFT and RL on one GPU.](docs/assets/banner.jpg)
+
 > **lumbridge-rl** is [Lumbridge](https://github.com/lumbridge-corp)'s light fork of [prime-rl](https://github.com/PrimeIntellect-ai/prime-rl) by Prime Intellect (Apache-2.0), with a DGX Spark install profile. What we changed: [LUMBRIDGE.md](LUMBRIDGE.md). The upstream README follows.
+
+![Terminal: an SFT smoke run of an 8B Gemma 4 model with LoRA on one RTX PRO 6000, loss falling from 8.00 to 0.37 at about 3,300 tokens a second; the same config does 320 tokens a second on a DGX Spark.](docs/assets/terminal.png)
 
 <p align="center">
 </p>
